@@ -96,7 +96,7 @@ if not GROQ_API_KEY:
 else:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY
 
-# ===== IMPORTACIONES GOOGLE EARTH ENGINE (NO MODIFICAR) =====
+# ===== IMPORTACIONES GOOGLE EARTH ENGINE =====
 try:
     import ee
     GEE_AVAILABLE = True
@@ -106,56 +106,77 @@ except ImportError:
 
 warnings.filterwarnings('ignore')
 
-# === INICIALIZACIÓN SEGURA DE GOOGLE EARTH ENGINE (CON CUENTA DE SERVICIO) ===
 def inicializar_gee():
     """Inicializa GEE con Service Account desde secrets de Streamlit Cloud"""
     if not GEE_AVAILABLE:
+        st.error("❌ La librería 'ee' no está instalada.")
         return False
-    
+
     try:
-        # Intentar con Service Account desde secrets (Streamlit Cloud)
+        # 1. Intento con cuenta de servicio desde secrets
         gee_secret = os.environ.get('GEE_SERVICE_ACCOUNT')
         if gee_secret:
             try:
                 credentials_info = json.loads(gee_secret.strip())
+                required_keys = ['client_email', 'private_key', 'project_id']
+                if not all(k in credentials_info for k in required_keys):
+                    st.error("❌ El secreto GEE_SERVICE_ACCOUNT no contiene todos los campos necesarios (client_email, private_key, project_id).")
+                    return False
+
+                # Crear credenciales
                 credentials = ee.ServiceAccountCredentials(
                     credentials_info['client_email'],
-                    key_data=json.dumps(credentials_info)
+                    key_data=json.dumps(credentials_info)  # o usar credentials_info['private_key'] directamente
                 )
-                # El proyecto se toma del secreto o se puede dejar por defecto
-                ee.Initialize(credentials, project=credentials_info.get('project_id', 'democultivos'))
-                st.session_state.gee_authenticated = True
-                st.session_state.gee_project = credentials_info.get('project_id', 'democultivos')
-                print("✅ GEE inicializado con Service Account (biomap.mp@gmail.com)")
-                return True
+                # Inicializar con el project_id correcto
+                project_id = credentials_info.get('project_id', 'democultivos')
+                ee.Initialize(credentials, project=project_id)
+                
+                # Verificación rápida: intentar obtener una imagen pública
+                try:
+                    test_image = ee.Image('LANDSAT/LC08/C02/T1_TOA/LC08_044034_20140318')
+                    test_image.getInfo()  # fuerza la llamada a la API
+                    st.session_state.gee_authenticated = True
+                    st.session_state.gee_project = project_id
+                    st.success(f"✅ GEE autenticado correctamente con cuenta de servicio: {credentials_info['client_email']} (proyecto: {project_id})")
+                    return True
+                except Exception as test_e:
+                    st.error(f"⚠️ Autenticación OK pero falló prueba de acceso a datos: {test_e}")
+                    # Esto puede indicar que la cuenta de servicio no está registrada en Earth Engine
+                    st.info("Verifica que la cuenta de servicio esté registrada en https://signup.earthengine.google.com/#!/service_accounts")
+                    return False
+
             except Exception as e:
-                print(f"⚠️ Error con Service Account: {str(e)}")
-        
-        # Fallback: autenticación local (desarrollo en tu Linux)
+                st.error(f"❌ Error al procesar el secreto GEE_SERVICE_ACCOUNT: {str(e)}")
+                # No retornamos aún, intentamos fallback local
+
+        # 2. Fallback: autenticación local (desarrollo) con credenciales de usuario
         try:
+            # Intenta inicializar sin credenciales explícitas (asume autenticación previa con earthengine authenticate)
             ee.Initialize(project='democultivos')
             st.session_state.gee_authenticated = True
             st.session_state.gee_project = 'democultivos'
-            print("✅ GEE inicializado localmente (modo desarrollo)")
+            st.success("✅ GEE inicializado localmente con credenciales de usuario (modo desarrollo)")
             return True
         except Exception as e:
-            print(f"⚠️ Error inicialización local: {str(e)}")
-            
+            st.warning(f"⚠️ No se pudo inicializar GEE localmente: {str(e)}")
+
+        # Si llegamos aquí, no hubo éxito
         st.session_state.gee_authenticated = False
-        return False
-        
-    except Exception as e:
-        st.session_state.gee_authenticated = False
-        print(f"❌ Error crítico GEE: {str(e)}")
+        st.error("❌ No se pudo autenticar Google Earth Engine. Verifica la configuración (secrets o autenticación local).")
         return False
 
-# Ejecutar inicialización al inicio (ANTES de cualquier uso de ee.*)
+    except Exception as e:
+        st.session_state.gee_authenticated = False
+        st.error(f"❌ Error crítico en inicialización GEE: {str(e)}")
+        return False
+
+# Ejecutar inicialización al inicio (solo una vez)
 if 'gee_authenticated' not in st.session_state:
     st.session_state.gee_authenticated = False
     st.session_state.gee_project = ''
     if GEE_AVAILABLE:
         inicializar_gee()
-
 # ===== NUEVAS FUNCIONES PARA MAPAS DE POTENCIAL DE COSECHA =====
 def crear_mapa_potencial_cosecha(gdf_completo, cultivo):
     """Crear mapa de potencial de cosecha"""
