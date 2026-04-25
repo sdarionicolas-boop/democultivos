@@ -23,6 +23,12 @@ import requests
 import contextily as ctx
 from PIL import Image
 
+from agroia_gee import (
+    obtener_ndvi_actual, obtener_ndwi_actual, obtener_ndre_actual,
+    obtener_temperatura_actual, obtener_precipitacion_actual,
+    obtener_serie_temporal_ndvi, obtener_serie_temporal_temperatura,
+    obtener_serie_temporal_precipitacion
+)
 # ================= CONFIGURACIÓN INICIAL =================
 warnings.filterwarnings('ignore')
 import matplotlib
@@ -231,89 +237,6 @@ def cargar_archivo_parcela(uploaded_file):
         st.error(f"❌ Error cargando archivo: {e}")
         return None
 
-# ================= FUNCIONES DE OBTENCIÓN DE DATOS TEMPORALES (GEE) =================
-def obtener_serie_temporal_ndvi(gdf, start_date, end_date):
-    """Retorna DataFrame con fechas y NDVI promedio diario (Sentinel-2)"""
-    try:
-        geom = ee.Geometry.Polygon(list(gdf.geometry.iloc[0].exterior.coords))
-        collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
-            .filterBounds(geom) \
-            .filterDate(start_date, end_date) \
-            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
-        def add_ndvi(img):
-            ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI')
-            return img.addBands(ndvi)
-        with_ndvi = collection.map(add_ndvi)
-        def get_daily_ndvi(img):
-            date = img.date().format('YYYY-MM-dd')
-            mean = img.select('NDVI').reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=geom,
-                scale=10,
-                bestEffort=True
-            ).get('NDVI')
-            return ee.Feature(None, {'date': date, 'ndvi': mean})
-        daily = with_ndvi.map(get_daily_ndvi)
-        data = daily.getInfo()
-        df = pd.DataFrame([f['properties'] for f in data['features']])
-        df['date'] = pd.to_datetime(df['date'])
-        df['ndvi'] = pd.to_numeric(df['ndvi'])
-        return df.sort_values('date')
-    except Exception as e:
-        st.error(f"Error en serie NDVI: {e}")
-        return pd.DataFrame()
-
-def obtener_serie_temporal_precipitacion(gdf, start_date, end_date):
-    """Precipitación diaria CHIRPS"""
-    try:
-        geom = ee.Geometry.Polygon(list(gdf.geometry.iloc[0].exterior.coords))
-        collection = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY') \
-            .filterBounds(geom) \
-            .filterDate(start_date, end_date) \
-            .select('precipitation')
-        def get_daily_precip(img):
-            date = img.date().format('YYYY-MM-dd')
-            mean = img.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=geom,
-                scale=5000,
-                bestEffort=True
-            ).get('precipitation')
-            return ee.Feature(None, {'date': date, 'precip': mean})
-        daily = collection.map(get_daily_precip)
-        data = daily.getInfo()
-        df = pd.DataFrame([f['properties'] for f in data['features']])
-        df['date'] = pd.to_datetime(df['date'])
-        df['precip'] = pd.to_numeric(df['precip'])
-        return df.sort_values('date')
-    except Exception as e:
-        return pd.DataFrame()
-
-def obtener_serie_temporal_temperatura(gdf, start_date, end_date):
-    """Temperatura media diaria ERA5-Land"""
-    try:
-        geom = ee.Geometry.Polygon(list(gdf.geometry.iloc[0].exterior.coords))
-        collection = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR') \
-            .filterBounds(geom) \
-            .filterDate(start_date, end_date) \
-            .select('temperature_2m')
-        def get_daily_temp(img):
-            date = img.date().format('YYYY-MM-dd')
-            mean = img.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=geom,
-                scale=10000,
-                bestEffort=True
-            ).get('temperature_2m')
-            return ee.Feature(None, {'date': date, 'temp': mean})
-        daily = collection.map(get_daily_temp)
-        data = daily.getInfo()
-        df = pd.DataFrame([f['properties'] for f in data['features']])
-        df['date'] = pd.to_datetime(df['date'])
-        df['temp'] = pd.to_numeric(df['temp']) - 273.15  # Kelvin a Celsius
-        return df.sort_values('date')
-    except Exception as e:
-        return pd.DataFrame()
 
 # ================= NUEVAS FUNCIONES PARA MAPAS DE CALOR (NDVI, NDRE, TEMP, PRECIP, NDWI) =================
 def obtener_imagen_gee_thumbnail(gdf, image_func, vis_params, dimensions='600x600'):
@@ -474,16 +397,13 @@ with st.spinner("Cargando parcela..."):
     area_ha = calcular_superficie(gdf)
     st.success(f"✅ Parcela cargada: {area_ha:.2f} ha, CRS EPSG:4326")
 
-# Obtener datos actuales (simulados o reales)
-ndvi_val = np.random.uniform(0.3, 0.8)
-temp_val = np.random.uniform(15, 32)
-humedad_val = np.random.uniform(0.2, 0.7)
-precip_actual = np.random.uniform(0, 20)
+ndvi_val      = obtener_ndvi_actual(gdf)
+humedad_val   = obtener_ndwi_actual(gdf)
+ndre_val      = obtener_ndre_actual(gdf)
+temp_val      = obtener_temperatura_actual(gdf)
+precip_actual = obtener_precipitacion_actual(gdf)
 
-# Series temporales (si GEE disponible)
-df_ndvi = pd.DataFrame()
-df_precip = pd.DataFrame()
-df_temp = pd.DataFrame()
+
 if st.session_state.get("gee_authenticated", False) and usar_gee:
     with st.spinner("Descargando series temporales desde GEE..."):
         df_ndvi = obtener_serie_temporal_ndvi(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
@@ -496,7 +416,10 @@ if st.session_state.get("gee_authenticated", False) and usar_gee:
         if not df_precip.empty:
             precip_actual = df_precip['precip'].iloc[-1]
 else:
-    st.info("GEE no autenticado o no seleccionado. Se usan datos simulados.")
+    df_ndvi = pd.DataFrame()
+    df_temp = pd.DataFrame()
+    df_precip = pd.DataFrame()
+    st.info("Series temporales no disponibles. GEE no autenticado.")
 
 # ================= PESTAÑAS =================
 tab_dashboard, tab_hist, tab_monitoreo, tab_alerta, tab_gobernanza, tab_export = st.tabs(
