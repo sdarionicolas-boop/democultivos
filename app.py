@@ -40,15 +40,15 @@ from shapely.geometry import Polygon
 # IMPORTS — OPCIONALES
 # ============================================================
 try:
-    from agroia_gee import (
+    from monitor_gee import (
         obtener_ndvi_actual, obtener_ndwi_actual, obtener_ndre_actual,
         obtener_temperatura_actual, obtener_precipitacion_actual,
         obtener_serie_temporal_ndvi, obtener_serie_temporal_temperatura,
         obtener_serie_temporal_precipitacion,
     )
-    AGROIA_OK = True
+    GEE_OK = True
 except ImportError:
-    AGROIA_OK = False
+    GEE_OK = False
 
 try:
     import folium
@@ -1083,7 +1083,7 @@ df_ndvi = pd.DataFrame()
 df_precip = pd.DataFrame()
 df_temp  = pd.DataFrame()
 
-if st.session_state.get("gee_authenticated", False) and AGROIA_OK:
+if st.session_state.get("gee_authenticated", False) and GEE_OK:
     with st.spinner("Obteniendo datos reales desde GEE..."):
         try:
             _v = obtener_ndvi_actual(gdf);         ndvi_val = _v if _v is not None else ndvi_val
@@ -1101,7 +1101,7 @@ if st.session_state.get("gee_authenticated", False) and AGROIA_OK:
         except Exception as _e:
             st.warning(f"⚠️ Error en series temporales: {_e}")
 else:
-    st.info("GEE no autenticado o módulo agroia_gee no encontrado. Se usan valores por defecto.")
+    st.info("GEE no autenticado o módulo gee no encontrado. Se usan valores por defecto.")
 
 # ── Cálculos FEN globales (usados en múltiples pestañas) ─────
 centroid_geom = gdf.geometry.centroid.iloc[0]
