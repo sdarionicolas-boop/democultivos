@@ -879,15 +879,15 @@ def obtener_datos_enfen_actuales():
 # FUNCIONES DEM (OPENTOPOGRAPHY)
 # ============================================================
 _DATASETS_DEM = {
-    "COP30 — Copernicus 30 m (recomendado Perú)": "COP30",
-    "COP90 — Copernicus 90 m":                    "COP90",
-    "SRTMGL1 — SRTM 30 m":                        "SRTMGL1",
-    "SRTMGL3 — SRTM 90 m":                        "SRTMGL3",
-    "NASADEM — NASA 30 m":                         "NASADEM",
-    "AW3D30 — ALOS 30 m":                          "AW3D30",
+    "SRTMGL1 — SRTM 30 m (recomendado costa/desierto)": "SRTMGL1",
+    "NASADEM — NASA 30 m":                              "NASADEM",
+    "COP30 — Copernicus 30 m":                          "COP30",
+    "COP90 — Copernicus 90 m":                          "COP90",
+    "SRTMGL3 — SRTM 90 m":                             "SRTMGL3",
+    "AW3D30 — ALOS 30 m":                              "AW3D30",
 }
 
-def obtener_dem_opentopography(bounds, api_key, dem_type="COP30"):
+def obtener_dem_opentopography(bounds, api_key, dem_type="SRTMGL1"):
     """Descarga DEM vía API REST de OpenTopography (sin bmi-topography)."""
     import requests as _req, tempfile, struct, io
     minx, miny, maxx, maxy = bounds
