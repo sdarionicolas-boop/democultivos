@@ -690,14 +690,17 @@ def calcular_vulnerabilidad_fen(gdf, cultivo, ndvi_actual, temp_actual, precip_a
     score = 0.0
 
     # Factor zona (elevación → región)
-    if elevation < 500:                                   # Costa
+    # Costa peruana real: < 200 m (llanura costera y valles bajos)
+    # Transición: 200–3000 m (estribaciones, valles interandinos)
+    # Sierra:     > 3000 m
+    if elevation < 200:                                   # Costa
         if centroid.y > -10:                              # Costa norte → mayor riesgo FEN
             score += 3.0
         else:
             score += 2.0
-    elif elevation < 2000:                                # Transición
+    elif elevation < 3000:                                # Transición / estribaciones
         score += 1.5
-    else:                                                 # Sierra
+    else:                                                 # Sierra alta
         score += 2.0
 
     # Factor NDVI
@@ -2006,13 +2009,26 @@ with tab_dem:
             c3.metric("📏 Elevación media",   f"{elev_mean:.0f} m")
             c4.metric("↕️ Rango altitudinal", f"{elev_range:.0f} m")
 
-            # Contexto agronómico de la elevación
-            if elev_mean < 500:
-                st.info(f"📍 Parcela en **zona costera** ({elev_mean:.0f} m) — mayor exposición a FEN directo.")
-            elif elev_mean < 2000:
-                st.info(f"📍 Parcela en **zona de transición** ({elev_mean:.0f} m) — riesgo FEN moderado.")
+            # Contexto agronómico de la elevación — alineado con calcular_vulnerabilidad_fen
+            _fen_score = st.session_state.get('vuln_score', vuln_score)
+            if elev_mean < 200:
+                st.info(
+                    f"📍 Parcela en **zona costera** ({elev_mean:.0f} m) — "
+                    f"exposición directa a FEN (anomalías mar, lluvias costeras). "
+                    f"Score FEN: **{_fen_score}/10**."
+                )
+            elif elev_mean < 3000:
+                st.info(
+                    f"📍 Parcela en **estribaciones / valles interandinos** ({elev_mean:.0f} m) — "
+                    f"riesgo FEN moderado (lluvias intensas posibles). "
+                    f"Score FEN: **{_fen_score}/10**."
+                )
             else:
-                st.info(f"📍 Parcela en **sierra** ({elev_mean:.0f} m) — lluvias superiores posibles en FEN.")
+                st.info(
+                    f"📍 Parcela en **sierra alta** ({elev_mean:.0f} m) — "
+                    f"lluvias superiores al promedio durante FEN. "
+                    f"Score FEN: **{_fen_score}/10**."
+                )
 
             st.markdown("---")
 
