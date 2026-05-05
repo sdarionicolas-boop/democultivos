@@ -34,21 +34,21 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
 import math
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, Point
 
 # ============================================================
 # IMPORTS — OPCIONALES
 # ============================================================
 try:
-    from agroia_gee import (
+    from monitor_gee import (
         obtener_ndvi_actual, obtener_ndwi_actual, obtener_ndre_actual,
         obtener_temperatura_actual, obtener_precipitacion_actual,
         obtener_serie_temporal_ndvi, obtener_serie_temporal_temperatura,
         obtener_serie_temporal_precipitacion,
     )
-    AGROIA_OK = True
+    GEE_OK = True
 except ImportError:
-    AGROIA_OK = False
+    GEE_OK = False
 
 try:
     import folium
@@ -93,11 +93,13 @@ except ImportError:
 
 try:
     import xarray as xr
-    import rioxarray  # noqa: F401
-    from bmi_topography import Topography
-    OPENTOPOGRAPHY_AVAILABLE = True
+    XARRAY_OK = True
 except ImportError:
-    OPENTOPOGRAPHY_AVAILABLE = False
+    xr = None
+    XARRAY_OK = False
+
+# DEM vía API REST — no requiere bmi-topography
+OPENTOPOGRAPHY_AVAILABLE = True  # requests siempre disponible
 
 try:
     from PIL import Image as PilImage
@@ -114,7 +116,79 @@ except ImportError:
 # ============================================================
 # SECRETS / ENV
 # ============================================================
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
+# Leer secrets.toml directamente como fallback robusto
+def _leer_secrets_toml():
+    """Lee .streamlit/secrets.toml manualmente si st.secrets falla."""
+    import pathlib
+    candidates = []
+    # Intentar múltiples ubicaciones posibles
+    try:
+        candidates.append(pathlib.Path(__file__).resolve().parent / ".streamlit" / "secrets.toml")
+    except Exception:
+        pass
+    candidates += [
+        pathlib.Path.cwd() / ".streamlit" / "secrets.toml",
+        pathlib.Path.home() / ".streamlit" / "secrets.toml",
+        pathlib.Path("/content/pachamama/.streamlit/secrets.toml"),  # Colab
+    ]
+    # Buscar en sys.argv si Streamlit pasó la ruta del script
+    import sys as _sys
+    for arg in _sys.argv:
+        if arg.endswith('.py'):
+            candidates.append(pathlib.Path(arg).resolve().parent / ".streamlit" / "secrets.toml")
+            break
+    for p in candidates:
+        if p.exists():
+            try:
+                raw = p.read_text(encoding="utf-8")
+                result = {}
+                current_section = result
+                current_key = None
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("[") and line.endswith("]"):
+                        sec = line[1:-1].strip()
+                        result[sec] = {}
+                        current_section = result[sec]
+                    elif "=" in line:
+                        k, _, v = line.partition("=")
+                        k = k.strip(); v = v.strip()
+                        if v.startswith('"') and v.endswith('"'):
+                            v = v[1:-1].replace("\\n", "\n")
+                        current_section[k] = v
+                return result
+            except Exception:
+                pass
+    return {}
+
+_SECRETS_FALLBACK = {}
+
+def _get_secret(key, default=""):
+    try:
+        val = st.secrets.get(key, None)
+        if val:
+            return val
+    except Exception:
+        pass
+    try:
+        return _SECRETS_FALLBACK.get(key, os.getenv(key, default))
+    except Exception:
+        return default
+
+def _get_secret_section(section):
+    try:
+        if section in st.secrets:
+            return dict(st.secrets[section])
+    except Exception:
+        pass
+    try:
+        return _SECRETS_FALLBACK.get(section, {})
+    except Exception:
+        return {}
+
+GROQ_API_KEY = _get_secret("GROQ_API_KEY")
 if GROQ_API_KEY and GROQ_AVAILABLE:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY
 
@@ -122,9 +196,7 @@ if GROQ_API_KEY and GROQ_AVAILABLE:
 #   OPENTOPOGRAPHY_API_KEY = "tu_clave_aqui"
 # O como variable de entorno antes de correr la app:
 #   set OPENTOPOGRAPHY_API_KEY=tu_clave_aqui  (Windows)
-OPENTOPOGRAPHY_API_KEY = st.secrets.get(
-    "OPENTOPOGRAPHY_API_KEY", os.getenv("OPENTOPOGRAPHY_API_KEY", "")
-)
+OPENTOPOGRAPHY_API_KEY = _get_secret("OPENTOPOGRAPHY_API_KEY")
 
 # ============================================================
 # PARÁMETROS DE CULTIVOS — con NDVI_min_fen añadido
@@ -209,31 +281,77 @@ def predecir_rendimiento(ndvi, precip, temp, codigo_enfen):
 # INICIALIZACIÓN DE GEE
 # ============================================================
 def inicializar_gee():
+    import json as _json
     if not GEE_AVAILABLE:
+        st.session_state['gee_error'] = "earthengine-api no instalado."
         return False
-    if 'gee_service_account' in st.secrets:
+    _gee_creds = _get_secret_section("gee_service_account")
+    if not _gee_creds:
+        # Intentar leer gee_credentials.json del directorio de la app
+        import pathlib as _pl, sys as _sys
+        _json_candidates = [
+            _pl.Path.cwd() / "gee_credentials.json",
+            _pl.Path(__file__).resolve().parent / "gee_credentials.json"
+            if "__file__" in dir() else _pl.Path.cwd() / "gee_credentials.json",
+        ]
+        for arg in _sys.argv:
+            if arg.endswith('.py'):
+                _json_candidates.append(_pl.Path(arg).resolve().parent / "gee_credentials.json")
+        for _jp in _json_candidates:
+            if _jp.exists():
+                try:
+                    with open(_jp) as _jf:
+                        _gee_creds = _json.load(_jf)
+                    break
+                except Exception:
+                    pass
+    if _gee_creds:
         try:
-            creds = st.secrets["gee_service_account"]
-            credentials = ee.ServiceAccountCredentials(
-                creds['client_email'], key_data=creds['private_key']
-            )
-            ee.Initialize(credentials, project=creds.get('project_id', 'democultivos'))
+            creds = _gee_creds
+            private_key = creds.get("private_key", "")
+            client_email = creds.get("client_email", "")
+            project_id = creds.get("project_id", "democultivos")
+            if not private_key or not client_email:
+                raise ValueError("Faltan private_key o client_email en credenciales")
+            # Escribir JSON temporal y usar key_file (más confiable que key_data)
+            import tempfile as _tmp
+            key_dict = {
+                "type": "service_account",
+                "project_id": project_id,
+                "private_key_id": creds.get("private_key_id", ""),
+                "private_key": private_key,
+                "client_email": client_email,
+                "client_id": creds.get("client_id", ""),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            }
+            with _tmp.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as _tf:
+                _json.dump(key_dict, _tf)
+                _tf_path = _tf.name
+            credentials = ee.ServiceAccountCredentials(client_email, key_file=_tf_path)
+            ee.Initialize(credentials, project=project_id)
             st.session_state.gee_authenticated = True
+            st.session_state.pop('gee_error', None)
             return True
         except Exception as e:
-            st.error(f"❌ Error con cuenta de servicio: {e}")
-    try:
-        ee.Initialize(project='applied-oxygen-459415-e2')
-        st.session_state.gee_authenticated = True
-        return True
-    except Exception as e:
-        st.session_state.gee_authenticated = False
-        return False
-
-if 'gee_authenticated' not in st.session_state:
+            st.session_state['gee_error'] = f"GEE service account error: {e}"
+            st.session_state.gee_authenticated = False
+            return False
+    # Silencioso - solo marcar como no autenticado
+    if 'gee_error' not in st.session_state:
+        st.session_state['gee_error'] = "GEE no configurado"
     st.session_state.gee_authenticated = False
-    if GEE_AVAILABLE:
-        inicializar_gee()
+    return False
+
+# Inicializar solo si es necesario
+try:
+    if 'gee_authenticated' not in st.session_state:
+        st.session_state.gee_authenticated = False
+        if GEE_AVAILABLE:
+            inicializar_gee()
+except Exception:
+    st.session_state.gee_authenticated = False
 
 # ============================================================
 # FUNCIONES DE CARGA DE PARCELA
@@ -770,14 +888,67 @@ _DATASETS_DEM = {
 }
 
 def obtener_dem_opentopography(bounds, api_key, dem_type="COP30"):
-    """Descarga DEM para el área de la parcela vía API de OpenTopography."""
+    """Descarga DEM vía API REST de OpenTopography (sin bmi-topography)."""
+    import requests as _req, tempfile, struct, io
+    minx, miny, maxx, maxy = bounds
+    # Agrandar bbox un poco para asegurar cobertura
+    pad = 0.005
+    params = {
+        "demtype": dem_type,
+        "south": miny - pad, "north": maxy + pad,
+        "west":  minx - pad, "east":  maxx + pad,
+        "outputFormat": "AAIGrid",
+        "API_Key": api_key,
+    }
+    url = "https://portal.opentopography.org/API/globaldem"
     try:
-        topo = Topography(api_key=api_key)
-        minx, miny, maxx, maxy = bounds
-        # OpenTopography espera (lat_min, lon_min, lat_max, lon_max)
-        # El parámetro correcto es dem_type (no dataset)
-        dem_path = topo.get_dem(bounds=(miny, minx, maxy, maxx), dem_type=dem_type)
-        return xr.open_dataarray(dem_path)
+        resp = _req.get(url, params=params, timeout=60)
+        resp.raise_for_status()
+        # Parsear formato AAIGrid (ASCII raster)
+        lines = resp.text.strip().splitlines()
+        header = {}
+        data_start = 0
+        for i, line in enumerate(lines):
+            parts = line.split()
+            if len(parts) == 2 and parts[0].lower() in ('ncols','nrows','xllcorner','yllcorner','cellsize','nodata_value'):
+                header[parts[0].lower()] = float(parts[1])
+                data_start = i + 1
+            elif len(parts) > 2:
+                data_start = i
+                break
+        ncols = int(header.get('ncols', 1))
+        nrows = int(header.get('nrows', 1))
+        xll   = header.get('xllcorner', minx)
+        yll   = header.get('yllcorner', miny)
+        cell  = header.get('cellsize', 0.001)
+        nodata = header.get('nodata_value', -9999)
+        rows = []
+        for line in lines[data_start:]:
+            vals = [float(v) for v in line.split()]
+            if vals: rows.append(vals)
+        if not rows:
+            st.error("❌ DEM vacío recibido de OpenTopography.")
+            return None
+        arr = np.array(rows, dtype=np.float32)
+        arr[arr == nodata] = np.nan
+        # Construir objeto simple con atributos compatibles
+        lons = xll + np.arange(ncols) * cell if XARRAY_OK else None
+        lats = yll + np.arange(nrows)[::-1] * cell if XARRAY_OK else None
+        if XARRAY_OK and xr is not None:
+            dem = xr.DataArray(arr, dims=["y","x"],
+                               coords={"y": lats, "x": lons},
+                               attrs={"dem_type": dem_type})
+        else:
+            # Fallback: objeto simple
+            class _DEM:
+                def __init__(self, a, lx, ly):
+                    self.values = a
+                    class _C:
+                        def __init__(self, v): self.values = v
+                    self.x = _C(lx if lx is not None else np.arange(a.shape[1]))
+                    self.y = _C(ly if ly is not None else np.arange(a.shape[0]))
+            dem = _DEM(arr, lons, lats)
+        return dem
     except Exception as e:
         st.error(f"❌ Error descargando DEM ({dem_type}): {e}")
         return None
@@ -1050,10 +1221,15 @@ with st.sidebar:
     st.caption("📊 Sentinel-2 · CHIRPS · ERA5-Land")
     gee_ok = st.session_state.get('gee_authenticated', False)
     st.caption(f"GEE: {'✅ Autenticado' if gee_ok else '❌ No autenticado'}")
+    if not gee_ok and 'gee_error' in st.session_state:
+        with st.expander("⚠️ Ver error GEE", expanded=False):
+            st.code(st.session_state['gee_error'], language=None)
     if not GROQ_AVAILABLE:
-        st.warning("⚠️ groq no instalado")
+        st.caption("⚠️ groq no instalado")
     if not FOLIUM_OK:
-        st.warning("⚠️ folium no instalado")
+        st.caption("⚠️ folium no instalado")
+    if not GEE_OK:
+        st.caption("⚠️ monitor_gee.py no encontrado")
     st.markdown("---")
     n_bloques = st.slider("🌾 Bloques para análisis NPK", 4, 64, 16)
     if st.button("🔄 Reintentar auth GEE"):
@@ -1083,7 +1259,7 @@ df_ndvi = pd.DataFrame()
 df_precip = pd.DataFrame()
 df_temp  = pd.DataFrame()
 
-if st.session_state.get("gee_authenticated", False) and AGROIA_OK:
+if st.session_state.get("gee_authenticated", False) and GEE_OK:
     with st.spinner("Obteniendo datos reales desde GEE..."):
         try:
             _v = obtener_ndvi_actual(gdf);         ndvi_val = _v if _v is not None else ndvi_val
@@ -1092,16 +1268,14 @@ if st.session_state.get("gee_authenticated", False) and AGROIA_OK:
             _v = obtener_precipitacion_actual(gdf); precip_actual = _v if _v is not None else precip_actual
             _v = obtener_ndwi_actual(gdf);         humedad_val = _v if _v is not None else humedad_val
         except Exception as _e:
-            st.warning(f"⚠️ Error obteniendo datos actuales: {_e}")
+            st.sidebar.warning(f"⚠️ Error datos GEE: {_e}")
     with st.spinner("Descargando series temporales..."):
         try:
             df_ndvi  = obtener_serie_temporal_ndvi(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
             df_precip = obtener_serie_temporal_precipitacion(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
             df_temp  = obtener_serie_temporal_temperatura(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
         except Exception as _e:
-            st.warning(f"⚠️ Error en series temporales: {_e}")
-else:
-    st.info("GEE no autenticado o módulo agroia_gee no encontrado. Se usan valores por defecto.")
+            st.sidebar.warning(f"⚠️ Error series GEE: {_e}")
 
 # ── Cálculos FEN globales (usados en múltiples pestañas) ─────
 centroid_geom = gdf.geometry.centroid.iloc[0]
@@ -1247,11 +1421,10 @@ with tab_dashboard:
 # ============================================================
 with tab_mapas:
     st.header("🗺️ Mapa de Riesgo Climático Interactivo")
-    st.markdown("Seleccioná el índice, el fondo y visualizá la imagen satelital real "
-                "con puntos críticos georeferenciados y panel informativo.")
+    st.markdown("Seleccioná el índice, el fondo y visualizá la imagen satelital con puntos críticos.")
 
-    if not (st.session_state.get("gee_authenticated", False) and usar_gee and FOLIUM_OK):
-        st.warning("⚠️ Se requiere GEE autenticado y folium instalado.")
+    if not FOLIUM_OK:
+        st.error("❌ folium no instalado. Agregá `folium` y `streamlit-folium` a requirements.txt.")
     else:
         col_idx, col_fondo = st.columns([2, 1])
         with col_idx:
@@ -1261,134 +1434,164 @@ with tab_mapas:
         with col_fondo:
             fondo = st.radio("Fondo", ["Google Hybrid","Esri Satellite"], horizontal=True)
 
-        with st.spinner(f"⏳ Generando mapa {indice} desde GEE…"):
-            if indice == "NDVI":
-                image = get_ndvi_image(gdf, fecha_fin)
-                vis = {'min':0.0,'max':0.8,'palette':['#d73027','#f46d43','#fdae61','#fee08b','#d9ef8b','#a6d96a','#66bd63','#1a9850']}
-                umbral_critico = UMBRALES[cultivo].get('NDVI_min', 0.3)
-                leyenda = [("#d73027","Muy bajo (<0.2)"),("#f1c40f","Bajo (0.2–0.4)"),("#2ecc71","Óptimo (>0.4)")]
-                unidad = ""
-            elif indice == "NDRE":
-                image = get_ndre_image(gdf, fecha_fin)
-                vis = {'min':-0.1,'max':0.4,'palette':['#d73027','#f46d43','#fdae61','#fee08b','#d9ef8b','#a6d96a','#66bd63','#1a9850']}
-                umbral_critico = UMBRALES[cultivo].get('NDRE_min', 0.10)
-                leyenda = [("#d73027","Bajo (<0.10)"),("#f1c40f","Moderado (0.10–0.20)"),("#2ecc71","Óptimo (>0.20)")]
-                unidad = ""
-            elif indice == "NDWI":
-                image = get_ndwi_image(gdf, fecha_fin)
-                vis = {'min':-0.5,'max':0.5,'palette':['#8B4513','#d4a464','#ffffcc','#74add1','#2b8cbe']}
-                umbral_critico = -0.2
-                leyenda = [("#8B4513","Seco (<-0.2)"),("#ffffcc","Normal"),("#2b8cbe","Húmedo (>0.2)")]
-                unidad = ""
-            elif indice == "Temperatura":
-                image, vis = get_temperature_image(gdf, fecha_fin)
-                umbral_critico = None
-                leyenda = [("#313695","Frío (<15°C)"),("#ffffbf","Óptimo"),("#d73027","Calor (>28°C)")]
-                unidad = " °C"
-            else:
-                image, vis = get_precipitation_image(gdf, fecha_fin)
-                umbral_critico = 1.0
-                leyenda = [("#f0f9e8","Seco (<5 mm)"),("#7bccc4","Moderado"),("#084081","Lluvioso (>20 mm)")]
-                unidad = " mm"
+        gee_ok_map = st.session_state.get("gee_authenticated", False) and usar_gee and GEE_AVAILABLE
 
-            geom_raw = gdf.geometry.iloc[0]
-            if geom_raw.geom_type == 'MultiPolygon':
-                geom_raw = max(geom_raw.geoms, key=lambda p: p.area)
-            poly_coords_ee = [[c[0], c[1]] for c in geom_raw.exterior.coords]
-            polygon_geom = ee.Geometry.Polygon(poly_coords_ee)
+        # ── Parámetros de visualización por índice ────────────────
+        if indice == "NDVI":
+            vis = {'min':0.0,'max':0.8,'palette':['#d73027','#f46d43','#fdae61','#fee08b','#d9ef8b','#a6d96a','#66bd63','#1a9850']}
+            umbral_critico = UMBRALES[cultivo].get('NDVI_min', 0.3)
+            leyenda = [("#d73027","Muy bajo (<0.2)"),("#f1c40f","Bajo (0.2–0.4)"),("#2ecc71","Óptimo (>0.4)")]
+            unidad = ""; mean_val_map = ndvi_val
+        elif indice == "NDRE":
+            vis = {'min':-0.1,'max':0.4,'palette':['#d73027','#f46d43','#fdae61','#fee08b','#d9ef8b','#a6d96a','#66bd63','#1a9850']}
+            umbral_critico = UMBRALES[cultivo].get('NDRE_min', 0.10)
+            leyenda = [("#d73027","Bajo (<0.10)"),("#f1c40f","Moderado (0.10–0.20)"),("#2ecc71","Óptimo (>0.20)")]
+            unidad = ""; mean_val_map = ndre_val if ndre_val is not None else ndvi_val
+        elif indice == "NDWI":
+            vis = {'min':-0.5,'max':0.5,'palette':['#8B4513','#d4a464','#ffffcc','#74add1','#2b8cbe']}
+            umbral_critico = -0.2
+            leyenda = [("#8B4513","Seco (<-0.2)"),("#ffffcc","Normal"),("#2b8cbe","Húmedo (>0.2)")]
+            unidad = ""; mean_val_map = humedad_val
+        elif indice == "Temperatura":
+            vis = None; umbral_critico = None
+            leyenda = [("#313695","Frío (<15°C)"),("#ffffbf","Óptimo"),("#d73027","Calor (>28°C)")]
+            unidad = " °C"; mean_val_map = temp_val
+        else:
+            vis = None; umbral_critico = 1.0
+            leyenda = [("#f0f9e8","Seco (<5 mm)"),("#7bccc4","Moderado"),("#084081","Lluvioso (>20 mm)")]
+            unidad = " mm"; mean_val_map = precip_actual
 
-            mean_val = get_mean_value(image, polygon_geom) or 0.0
-            riesgo, riesgo_emoji = determinar_riesgo(indice, mean_val, cultivo, UMBRALES[cultivo])
+        riesgo_map, riesgo_emoji_map = determinar_riesgo(indice, mean_val_map, cultivo, UMBRALES[cultivo])
+        critical_coords = []
+        tile_url = None
 
-            critical_coords = []
-            if umbral_critico is not None:
-                critical_coords = get_critical_points(image, polygon_geom, umbral_critico, 20)
-            num_criticos = len(critical_coords)
+        # ── Capa GEE (solo si autenticado) ───────────────────────
+        if gee_ok_map:
+            with st.spinner(f"⏳ Cargando capa {indice} desde GEE…"):
+                try:
+                    if indice == "NDVI":
+                        image = get_ndvi_image(gdf, fecha_fin)
+                    elif indice == "NDRE":
+                        image = get_ndre_image(gdf, fecha_fin)
+                    elif indice == "NDWI":
+                        image = get_ndwi_image(gdf, fecha_fin)
+                    elif indice == "Temperatura":
+                        image, vis = get_temperature_image(gdf, fecha_fin)
+                    else:
+                        image, vis = get_precipitation_image(gdf, fecha_fin)
 
-            bounds = gdf.total_bounds
-            c_lat, c_lon, zoom = obtener_zoom_con_margen(bounds)
-            mapa = folium.Map(location=[c_lat, c_lon], zoom_start=zoom, control_scale=True, tiles=None)
+                    geom_raw = gdf.geometry.iloc[0]
+                    if geom_raw.geom_type == 'MultiPolygon':
+                        geom_raw = max(geom_raw.geoms, key=lambda p: p.area)
+                    poly_coords_ee = [[c[0], c[1]] for c in geom_raw.exterior.coords]
+                    polygon_geom = ee.Geometry.Polygon(poly_coords_ee)
 
-            folium.TileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                             attr='OpenStreetMap', name='OpenStreetMap').add_to(mapa)
-            if fondo == "Google Hybrid":
-                folium.TileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                                 attr='Google Hybrid', name='Google Hybrid').add_to(mapa)
-            else:
-                folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                                 attr='Esri World Imagery', name='Esri Satellite').add_to(mapa)
+                    _v = get_mean_value(image, polygon_geom)
+                    if _v is not None: mean_val_map = _v
+                    riesgo_map, riesgo_emoji_map = determinar_riesgo(indice, mean_val_map, cultivo, UMBRALES[cultivo])
 
-            tile_url = obtener_tile_url_gee(image, vis)
-            if tile_url:
-                folium.TileLayer(tiles=tile_url, attr='GEE · Sentinel-2',
-                                 name=f'{indice} (Sentinel-2)', overlay=True, control=True, opacity=0.88).add_to(mapa)
+                    if umbral_critico is not None:
+                        critical_coords = get_critical_points(image, polygon_geom, umbral_critico, 20)
 
-            popup_poly_html = (
-                f'<div style="font-family:Arial;min-width:210px;">'
-                f'<h4 style="margin:0;color:#2ca02c;">{riesgo_emoji} {ICONOS[cultivo]} {cultivo}</h4>'
-                f'<p style="margin:4px 0;font-size:11px;color:#888;">{area_ha:.2f} ha</p>'
-                f'<hr style="margin:6px 0;">'
-                f'<table style="font-size:13px;width:100%;">'
-                f'<tr><td>{indice}</td><td><b>{mean_val:.3f}{unidad}</b></td></tr>'
-                f'<tr><td>Área</td><td><b>{area_ha:.2f} ha</b></td></tr>'
-                f'<tr><td>Puntos críticos</td><td><b>{num_criticos}</b></td></tr>'
-                f'<tr><td>🚨 Vuln. FEN</td><td><b>{vuln_score}/10</b></td></tr>'
-                f'</table>'
-                f'<hr style="margin:6px 0;">'
-                f'<div style="text-align:center;padding:4px;background:#2ca02c;color:white;border-radius:4px;font-weight:bold;">Riesgo {riesgo}</div>'
-                f'</div>'
-            )
-            folium.GeoJson(gdf.__geo_interface__, name='Parcela',
-                           style_function=lambda x: {'color':'#2ca02c','weight':3,'dashArray':'6','fillColor':'#2ca02c','fillOpacity':0.15},
-                           tooltip=f'{riesgo_emoji} {cultivo} — Riesgo {riesgo} ({indice}: {mean_val:.3f})',
-                           popup=folium.Popup(popup_poly_html, max_width=250)).add_to(mapa)
+                    if vis:
+                        tile_url = obtener_tile_url_gee(image, vis)
+                except Exception as _e:
+                    st.warning(f"⚠️ Error cargando capa GEE: {_e}")
 
-            for lon_pt, lat_pt in critical_coords:
-                popup_pt = (f'<div style="font-family:Arial;"><b>⚠️ Punto Crítico</b><br>'
-                            f'{indice}: bajo umbral<br>Lat:{lat_pt:.5f}<br>Lon:{lon_pt:.5f}<br>'
-                            f'<a href="https://www.google.com/maps/search/?api=1&query={lat_pt},{lon_pt}" target="_blank">📍 Google Maps</a></div>')
-                folium.CircleMarker(location=[lat_pt, lon_pt], radius=6, color='red', weight=3,
-                                    fill=True, fill_color='white', fill_opacity=0.2,
-                                    popup=folium.Popup(popup_pt, max_width='100%'),
-                                    tooltip=f'Crítico: {lat_pt:.4f},{lon_pt:.4f}').add_to(mapa)
+        num_criticos = len(critical_coords)
 
-            clat_m = gdf.geometry.centroid.y.iloc[0]
-            clon_m = gdf.geometry.centroid.x.iloc[0]
-            label_html = (
-                f'<div style="background:white;border:2px solid #2ca02c;border-radius:6px;'
-                f'padding:3px 8px;font-size:11px;font-weight:bold;box-shadow:2px 2px 4px rgba(0,0,0,0.3);white-space:nowrap;">'
-                f'{riesgo_emoji} {ICONOS[cultivo]} {cultivo}<br>'
-                f'<span style="font-size:10px;color:#555;">{indice}:{mean_val:.3f} | Riesgo {riesgo} | FEN {vuln_score}/10</span></div>'
-            )
-            folium.Marker(location=[clat_m, clon_m],
-                          icon=folium.DivIcon(html=label_html, icon_size=(230,35), icon_anchor=(115,17))).add_to(mapa)
+        # ── Construir mapa folium (SIEMPRE) ──────────────────────
+        bounds = gdf.total_bounds
+        c_lat, c_lon, zoom = obtener_zoom_con_margen(bounds)
+        mapa = folium.Map(location=[c_lat, c_lon], zoom_start=zoom, control_scale=True, tiles=None)
 
-            riesgo_color = "#2ca02c" if riesgo=="BAJO" else "#f39c12" if riesgo=="MEDIO" else "#e74c3c"
-            leyenda_html = "".join(f'<span style="color:{c};">■</span> {txt}&nbsp;&nbsp;' for c, txt in leyenda)
-            panel_html = (
-                f'<div style="position:fixed;bottom:40px;left:40px;z-index:1000;background:white;'
-                f'padding:12px 16px;border-radius:8px;border:1px solid #ccc;'
-                f'box-shadow:2px 2px 8px rgba(0,0,0,0.2);font-family:Arial;font-size:12px;min-width:190px;">'
-                f'<b style="font-size:13px;">{ICONOS[cultivo]} {cultivo}</b>'
-                f'<hr style="margin:6px 0;">'
-                f'<b>Riesgo:</b> <span style="color:{riesgo_color};">● {riesgo}</span><br>'
-                f'<b>{indice}:</b> {mean_val:.3f}{unidad}<br>'
-                + (f'<b>NDRE:</b> {ndre_val:.3f}<br>' if ndre_val is not None else '')
-                + f'<b>Área:</b> {area_ha:.2f} ha<br>'
-                f'<b>Puntos críticos:</b> {num_criticos}<br>'
-                f'<b>🚨 Vuln. FEN:</b> {vuln_score}/10'
-                f'<hr style="margin:6px 0;">'
-                f'{leyenda_html}'
-                f'<hr style="margin:6px 0;">'
-                f'<span style="font-size:10px;color:#888;">Sentinel-2 · ERA5 · CHIRPS</span>'
-                f'</div>'
-            )
-            Element(panel_html).add_to(mapa)
-            folium.LayerControl(collapsed=False).add_to(mapa)
+        folium.TileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                         attr='OpenStreetMap', name='OpenStreetMap').add_to(mapa)
+        if fondo == "Google Hybrid":
+            folium.TileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+                             attr='Google Hybrid', name='Google Hybrid').add_to(mapa)
+        else:
+            folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                             attr='Esri World Imagery', name='Esri Satellite').add_to(mapa)
 
-            components.html(mapa.get_root().render(), height=650)
-            st.caption(f"📊 **{indice}:** {mean_val:.3f}{unidad} · Riesgo: **{riesgo}** · "
-                       f"{num_criticos} puntos críticos · Vuln. FEN: **{vuln_score}/10**")
+        if tile_url:
+            folium.TileLayer(tiles=tile_url, attr='GEE · Sentinel-2',
+                             name=f'{indice} (Sentinel-2)', overlay=True, control=True, opacity=0.88).add_to(mapa)
+
+        # Polígono parcela
+        riesgo_color = "#2ca02c" if riesgo_map=="BAJO" else "#f39c12" if riesgo_map=="MEDIO" else "#e74c3c"
+        popup_poly_html = (
+            f'<div style="font-family:Arial;min-width:210px;">'
+            f'<h4 style="margin:0;color:#2ca02c;">{riesgo_emoji_map} {ICONOS[cultivo]} {cultivo}</h4>'
+            f'<p style="margin:4px 0;font-size:11px;color:#888;">{area_ha:.2f} ha</p>'
+            f'<hr style="margin:6px 0;">'
+            f'<table style="font-size:13px;width:100%;">'
+            f'<tr><td>{indice}</td><td><b>{mean_val_map:.3f}{unidad}</b></td></tr>'
+            f'<tr><td>Área</td><td><b>{area_ha:.2f} ha</b></td></tr>'
+            f'<tr><td>Puntos críticos</td><td><b>{num_criticos}</b></td></tr>'
+            f'<tr><td>🚨 Vuln. FEN</td><td><b>{vuln_score}/10</b></td></tr>'
+            f'</table>'
+            f'<hr style="margin:6px 0;">'
+            f'<div style="text-align:center;padding:4px;background:{riesgo_color};color:white;border-radius:4px;font-weight:bold;">Riesgo {riesgo_map}</div>'
+            f'</div>'
+        )
+        folium.GeoJson(gdf.__geo_interface__, name='Parcela',
+                       style_function=lambda x: {'color':'#2ca02c','weight':3,'dashArray':'6','fillColor':'#2ca02c','fillOpacity':0.15},
+                       tooltip=f'{riesgo_emoji_map} {cultivo} — Riesgo {riesgo_map} ({indice}: {mean_val_map:.3f})',
+                       popup=folium.Popup(popup_poly_html, max_width=250)).add_to(mapa)
+
+        # Puntos críticos
+        for lon_pt, lat_pt in critical_coords:
+            popup_pt = (f'<div style="font-family:Arial;"><b>⚠️ Punto Crítico</b><br>'
+                        f'{indice}: bajo umbral<br>Lat:{lat_pt:.5f}<br>Lon:{lon_pt:.5f}<br>'
+                        f'<a href="https://www.google.com/maps/search/?api=1&query={lat_pt},{lon_pt}" target="_blank">📍 Google Maps</a></div>')
+            folium.CircleMarker(location=[lat_pt, lon_pt], radius=6, color='red', weight=3,
+                                fill=True, fill_color='white', fill_opacity=0.2,
+                                popup=folium.Popup(popup_pt, max_width='100%'),
+                                tooltip=f'Crítico: {lat_pt:.4f},{lon_pt:.4f}').add_to(mapa)
+
+        # Label central
+        clat_m = gdf.geometry.centroid.y.iloc[0]
+        clon_m = gdf.geometry.centroid.x.iloc[0]
+        gee_badge = "🛰️ GEE" if gee_ok_map and tile_url else "🗺️ OSM"
+        label_html = (
+            f'<div style="background:white;border:2px solid #2ca02c;border-radius:6px;'
+            f'padding:3px 8px;font-size:11px;font-weight:bold;box-shadow:2px 2px 4px rgba(0,0,0,0.3);white-space:nowrap;">'
+            f'{riesgo_emoji_map} {ICONOS[cultivo]} {cultivo} · {gee_badge}<br>'
+            f'<span style="font-size:10px;color:#555;">{indice}: {mean_val_map:.3f} | Riesgo {riesgo_map} | FEN {vuln_score}/10</span></div>'
+        )
+        folium.Marker(location=[clat_m, clon_m],
+                      icon=folium.DivIcon(html=label_html, icon_size=(240,35), icon_anchor=(120,17))).add_to(mapa)
+
+        # Panel flotante
+        leyenda_html = "".join(f'<span style="color:{c};">■</span> {txt}&nbsp;&nbsp;' for c, txt in leyenda)
+        panel_html = (
+            f'<div style="position:fixed;bottom:40px;left:40px;z-index:1000;background:white;'
+            f'padding:12px 16px;border-radius:8px;border:1px solid #ccc;'
+            f'box-shadow:2px 2px 8px rgba(0,0,0,0.2);font-family:Arial;font-size:12px;min-width:190px;">'
+            f'<b style="font-size:13px;">{ICONOS[cultivo]} {cultivo}</b>'
+            f'<hr style="margin:6px 0;">'
+            f'<b>Riesgo:</b> <span style="color:{riesgo_color};">● {riesgo_map}</span><br>'
+            f'<b>{indice}:</b> {mean_val_map:.3f}{unidad}<br>'
+            + (f'<b>NDRE:</b> {ndre_val:.3f}<br>' if ndre_val is not None else '')
+            + f'<b>Área:</b> {area_ha:.2f} ha<br>'
+            f'<b>Puntos críticos:</b> {num_criticos}<br>'
+            f'<b>🚨 Vuln. FEN:</b> {vuln_score}/10'
+            f'<hr style="margin:6px 0;">'
+            f'{leyenda_html}'
+            f'<hr style="margin:6px 0;">'
+            f'<span style="font-size:10px;color:#888;">{"Sentinel-2 · ERA5 · CHIRPS" if gee_ok_map else "OpenStreetMap · valores por defecto"}</span>'
+            f'</div>'
+        )
+        Element(panel_html).add_to(mapa)
+        folium.LayerControl(collapsed=False).add_to(mapa)
+
+        components.html(mapa.get_root().render(), height=650)
+
+        if not gee_ok_map:
+            st.info("🗺️ Mapa base activo. Autenticá GEE en el panel lateral para agregar capas satelitales Sentinel-2.")
+        st.caption(f"📊 **{indice}:** {mean_val_map:.3f}{unidad} · Riesgo: **{riesgo_map}** · "
+                   f"{num_criticos} puntos críticos · Vuln. FEN: **{vuln_score}/10**")
 
 # ============================================================
 # MONITOREO FENOLÓGICO  (Nivel 3)
@@ -1554,6 +1757,45 @@ with tab_export:
     )
     st.download_button("⬇️ Resumen FEN TXT", data=resumen_fen, file_name="resumen_fen.txt")
 
+    # ── Exportar para biomod2 (R) ─────────────────────────────
+    st.markdown("---")
+    st.subheader("📦 Exportar para biomod2 (R)")
+    st.markdown(
+        "Genera un CSV con puntos dentro de la parcela y variables ambientales "
+        "para modelado de nicho ecológico en R con `biomod2`."
+    )
+    if st.button("🔬 Generar archivo biomod2"):
+        bounds = gdf.total_bounds
+        minx, miny, maxx, maxy = bounds
+        step = 0.001  # ~111 m — ajustable
+        points = []
+        for x in np.arange(minx, maxx, step):
+            for y in np.arange(miny, maxy, step):
+                pt = Point(x, y)
+                if gdf.geometry.iloc[0].contains(pt):
+                    points.append([x, y])
+        if not points:
+            st.error("No se generaron puntos internos. Reducí el paso (step).")
+        else:
+            df_points = pd.DataFrame(points, columns=['longitud', 'latitud'])
+            df_points['NDVI']              = ndvi_val
+            df_points['temperatura_C']     = temp_val
+            df_points['precipitacion_mm']  = precip_actual
+            df_points['humedad_suelo']     = humedad_val
+            df_points['elevacion_m']       = elevation_est
+            df_points['rendimiento_t_ha']  = predecir_rendimiento(
+                ndvi_val, precip_actual, temp_val, codigo_enfen
+            )
+            umbral_ndvi = UMBRALES[cultivo]['NDVI_min']
+            df_points['Presence'] = (df_points['NDVI'] >= umbral_ndvi).astype(int)
+            st.download_button(
+                "📥 Descargar CSV para biomod2",
+                data=df_points.to_csv(index=False),
+                file_name=f"biomod2_{cultivo}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv",
+            )
+            st.success(f"✅ {len(df_points)} puntos generados dentro de la parcela.")
+
 # ============================================================
 # NIVEL 6 — PESTAÑA "📊 Análisis FEN"
 # ============================================================
@@ -1704,16 +1946,26 @@ with tab_dem:
     )
 
     if not OPENTOPOGRAPHY_AVAILABLE:
-        st.error("⚠️ Librerías DEM no instaladas. Ejecuta: "
-                 "`pip install bmi-topography xarray rioxarray`")
-    elif not OPENTOPOGRAPHY_API_KEY:
-        st.warning(
-            "⚠️ Falta la API key de OpenTopography. Agrégala en `.streamlit/secrets.toml`:\n\n"
-            "```toml\nOPENTOPOGRAPHY_API_KEY = \"tu_clave_aqui\"\n```\n\n"
-            "O antes de correr la app en Windows:\n\n"
-            "```\nset OPENTOPOGRAPHY_API_KEY=tu_clave_aqui\n```"
-        )
+        st.error("❌ requests no disponible — módulo DEM inactivo.")
     else:
+        # Permitir ingresar la key manualmente si no está en secrets
+        _ot_key = OPENTOPOGRAPHY_API_KEY
+        if not _ot_key:
+            _ot_key = st.session_state.get("ot_api_key_manual", "")
+            _key_input = st.text_input(
+                "🔑 API Key de OpenTopography",
+                value=_ot_key,
+                type="password",
+                help="Conseguila gratis en https://opentopography.org/developers"
+            )
+            if _key_input:
+                st.session_state["ot_api_key_manual"] = _key_input
+                _ot_key = _key_input
+            if not _ot_key:
+                st.info("Ingresá tu API key de OpenTopography para descargar el DEM. "
+                        "Es gratuita: [opentopography.org/developers](https://opentopography.org/developers)")
+                st.stop()
+
         bounds_dem = gdf.total_bounds
         col_ds, col_btn = st.columns([3, 1])
         with col_ds:
@@ -1725,7 +1977,7 @@ with tab_dem:
         if cargar_dem:
             dataset_sel = _DATASETS_DEM[resolucion]
             with st.spinner(f"Descargando DEM {resolucion} desde OpenTopography..."):
-                dem = obtener_dem_opentopography(bounds_dem, OPENTOPOGRAPHY_API_KEY, dem_type=dataset_sel)
+                dem = obtener_dem_opentopography(bounds_dem, _ot_key, dem_type=dataset_sel)
             if dem is not None:
                 st.session_state["dem_data"]     = dem
                 st.session_state["dem_dataset"]  = resolucion
@@ -1842,208 +2094,190 @@ st.caption("Plataforma Pachamama — FEN Nivel 1-6 · DEM · Sentinel-2 · ERA5 
 # FERTILIDAD NPK POR BLOQUES
 # ============================================================
 with tab_npk:
-    st.header("🌾 Fertilidad NPK por Bloques")
-    st.markdown(
-        "Divide la parcela en zonas, obtiene el NDVI real de GEE para cada bloque "
-        "y calcula la dosis de fertilizante N/P/K y el potencial de cosecha por zona."
-    )
+    try:
+        st.header("🌾 Fertilidad NPK por Bloques")
+        st.markdown(
+            "Divide la parcela en zonas, obtiene el NDVI real de GEE para cada bloque "
+            "y calcula la dosis de fertilizante N/P/K y el potencial de cosecha por zona."
+        )
 
-    if st.button("🔬 Calcular fertilidad por bloque", type="primary"):
-        with st.spinner(f"Dividiendo en {n_bloques} bloques y consultando GEE…"):
-            gdf_bloques = dividir_parcela_en_bloques(gdf, n_bloques)
-            if gdf_bloques is None or len(gdf_bloques) == 0:
-                st.error("No se pudo dividir la parcela.")
-            else:
-                ndvis = obtener_ndvi_por_bloque(gdf_bloques, fecha_fin)
-                gdf_bloques['ndvi'] = ndvis
+        n_bloques = st.slider("🌾 Número de bloques", 4, 64, 16, key="n_bloques_npk")
 
-                areas_bloque = []
-                for _, row in gdf_bloques.iterrows():
-                    a = calcular_superficie(gpd.GeoDataFrame(
-                        {'geometry': [row.geometry]}, crs='EPSG:4326'
-                    ))
-                    areas_bloque.append(a)
-                gdf_bloques['area_ha'] = areas_bloque
+        if st.button("🔬 Calcular fertilidad por bloque", type="primary"):
+            with st.spinner(f"Dividiendo en {n_bloques} bloques y consultando GEE…"):
+                gdf_bloques = dividir_parcela_en_bloques(gdf, n_bloques)
+                if gdf_bloques is None or len(gdf_bloques) == 0:
+                    st.error("No se pudo dividir la parcela.")
+                else:
+                    ndvis = obtener_ndvi_por_bloque(gdf_bloques, fecha_fin)
+                    gdf_bloques['ndvi'] = ndvis
 
-                recs = [calcular_recomendaciones_npk(v, cultivo)
-                        for v in gdf_bloques['ndvi']]
-                gdf_bloques['nivel']   = [r['nivel'] for r in recs]
-                gdf_bloques['N_kg_ha'] = [r['N']     for r in recs]
-                gdf_bloques['P_kg_ha'] = [r['P']     for r in recs]
-                gdf_bloques['K_kg_ha'] = [r['K']     for r in recs]
-
-                rends = [estimar_potencial_cosecha(v, cultivo, a)
-                         for v, a in zip(gdf_bloques['ndvi'], gdf_bloques['area_ha'])]
-                gdf_bloques['rend_t_ha']    = [r[0] for r in rends]
-                gdf_bloques['prod_total_t'] = [r[1] for r in rends]
-
-                # Métricas resumen
-                c1, c2, c3, c4 = st.columns(4)
-                ndvi_med = gdf_bloques['ndvi'].mean()
-                c1.metric("NDVI promedio",     f"{ndvi_med:.3f}")
-                c2.metric("Bloques críticos",  str((gdf_bloques['N_kg_ha'] > 40).sum()))
-                c3.metric("Rend. medio (t/ha)",f"{gdf_bloques['rend_t_ha'].mean():.1f}")
-                c4.metric("Producción total",  f"{gdf_bloques['prod_total_t'].sum():.1f} t")
-
-                # Tabla
-                st.subheader("📋 Detalle por bloque")
-                display_cols = ['id_bloque','area_ha','ndvi','nivel',
-                                'N_kg_ha','P_kg_ha','K_kg_ha',
-                                'rend_t_ha','prod_total_t']
-                st.dataframe(gdf_bloques[display_cols].round(3), use_container_width=True)
-
-                # Mapa de calor NDVI por bloque
-                if FOLIUM_OK:
-                    st.subheader("🗺️ Mapa de calor NDVI por bloque")
-                    bounds_b = gdf_bloques.total_bounds
-                    c_lat, c_lon, z = obtener_zoom_con_margen(bounds_b)
-                    m_npk = folium.Map(location=[c_lat, c_lon], zoom_start=z,
-                                       tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                                       attr='Google Hybrid')
-                    vmin = gdf_bloques['ndvi'].min()
-                    vmax = gdf_bloques['ndvi'].max()
-                    cmap_fn = plt.cm.RdYlGn
+                    areas_bloque = []
                     for _, row in gdf_bloques.iterrows():
-                        ndvi_b = row['ndvi'] if not np.isnan(row['ndvi']) else 0.3
-                        norm_v = (ndvi_b - vmin) / max(vmax - vmin, 0.01)
-                        r_, g_, b_, _ = cmap_fn(norm_v)
-                        hex_color = '#{:02x}{:02x}{:02x}'.format(
-                            int(r_*255), int(g_*255), int(b_*255))
-                        popup_txt = (f"Bloque {int(row.id_bloque)}<br>"
-                                     f"NDVI: {ndvi_b:.3f}<br>"
-                                     f"N: {int(row.N_kg_ha)} kg/ha · "
-                                     f"P: {int(row.P_kg_ha)} · K: {int(row.K_kg_ha)}<br>"
-                                     f"Rend.: {row.rend_t_ha:.1f} t/ha")
-                        folium.GeoJson(
-                            gpd.GeoDataFrame({'geometry': [row.geometry]},
-                                             crs='EPSG:4326').__geo_interface__,
-                            style_function=lambda x, c=hex_color: {
-                                'fillColor': c, 'color': '#333', 'weight': 1, 'fillOpacity': 0.7},
-                            tooltip=f"Bloque {int(row.id_bloque)} · NDVI {ndvi_b:.3f}",
-                            popup=folium.Popup(popup_txt, max_width=200),
-                        ).add_to(m_npk)
-                    map_npk_html = m_npk.get_root().render()
-                    components.html(map_npk_html, height=500)
+                        a = calcular_superficie(gpd.GeoDataFrame(
+                            {'geometry': [row.geometry]}, crs='EPSG:4326'
+                        ))
+                        areas_bloque.append(a)
+                    gdf_bloques['area_ha'] = areas_bloque
 
-                # Descarga
-                st.download_button(
-                    "⬇️ Descargar CSV fertilidad",
-                    data=gdf_bloques[display_cols].to_csv(index=False),
-                    file_name=f"fertilidad_npk_{cultivo}.csv",
-                    mime="text/csv",
-                )
+                    recs = [calcular_recomendaciones_npk(v, cultivo)
+                            for v in gdf_bloques['ndvi']]
+                    gdf_bloques['nivel']   = [r['nivel'] for r in recs]
+                    gdf_bloques['N_kg_ha'] = [r['N']     for r in recs]
+                    gdf_bloques['P_kg_ha'] = [r['P']     for r in recs]
+                    gdf_bloques['K_kg_ha'] = [r['K']     for r in recs]
+
+                    rends = [estimar_potencial_cosecha(v, cultivo, a)
+                             for v, a in zip(gdf_bloques['ndvi'], gdf_bloques['area_ha'])]
+                    gdf_bloques['rend_t_ha']    = [r[0] for r in rends]
+                    gdf_bloques['prod_total_t'] = [r[1] for r in rends]
+
+                    # Métricas resumen
+                    c1, c2, c3, c4 = st.columns(4)
+                    ndvi_med = gdf_bloques['ndvi'].mean()
+                    c1.metric("NDVI promedio",     f"{ndvi_med:.3f}")
+                    c2.metric("Bloques críticos",  str((gdf_bloques['N_kg_ha'] > 40).sum()))
+                    c3.metric("Rend. medio (t/ha)",f"{gdf_bloques['rend_t_ha'].mean():.1f}")
+                    c4.metric("Producción total",  f"{gdf_bloques['prod_total_t'].sum():.1f} t")
+
+                    # Tabla
+                    st.subheader("📋 Detalle por bloque")
+                    display_cols = ['id_bloque','area_ha','ndvi','nivel',
+                                    'N_kg_ha','P_kg_ha','K_kg_ha',
+                                    'rend_t_ha','prod_total_t']
+                    st.dataframe(gdf_bloques[display_cols].round(3), use_container_width=True)
+
+                    # Descarga
+                    st.download_button(
+                        "⬇️ Descargar CSV fertilidad",
+                        data=gdf_bloques[display_cols].to_csv(index=False),
+                        file_name=f"fertilidad_npk_{cultivo}.csv",
+                        mime="text/csv",
+                    )
+    except Exception as e:
+        st.error(f"⚠️ Error en Fertilidad NPK: {e}")
+        st.info("Configure GEE para análisis completo, o use datos simulados.")
 
 # ============================================================
 # AGROECOLOGÍA — 10 PRINCIPIOS
 # ============================================================
 with tab_agro:
-    st.header("🌱 Agroecología — 10 Principios")
-    st.markdown(
-        "Recomendaciones agronómicas basadas en los **10 principios agroecológicos** "
-        "adaptadas al estado actual de la parcela y contexto FEN."
-    )
+    try:
+        st.header("🌱 Agroecología — 10 Principios")
+        st.markdown(
+            "Recomendaciones agronómicas basadas en los **10 principios agroecológicos** "
+            "adaptadas al estado actual de la parcela y contexto FEN."
+        )
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("🌿 Recomendación por principio", type="primary"):
-            with st.spinner("Generando recomendaciones agroecológicas…"):
-                rec = generar_recomendaciones_agroecologicas(
-                    cultivo, fase_fenologica, ndvi_val, temp_val, humedad_val, precip_actual
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("🌿 Recomendación por principio", type="primary"):
+                with st.spinner("Generando recomendaciones agroecológicas…"):
+                    rec = generar_recomendaciones_agroecologicas(
+                        cultivo, fase_fenologica, ndvi_val, temp_val, humedad_val, precip_actual
+                    )
+                st.markdown("### 🌿 Recomendaciones por Principio Agroecológico")
+                st.markdown(rec)
+                st.download_button(
+                    "⬇️ Descargar recomendaciones",
+                    data=rec,
+                    file_name=f"agroecologia_principios_{cultivo}.txt",
                 )
-            st.markdown("### 🌿 Recomendaciones por Principio Agroecológico")
-            st.markdown(rec)
-            st.download_button(
-                "⬇️ Descargar recomendaciones",
-                data=rec,
-                file_name=f"agroecologia_principios_{cultivo}.txt",
-            )
-    with col_b:
-        if st.button("📋 Plan agroecológico completo"):
-            with st.spinner("Generando plan completo…"):
-                plan = generar_plan_agroecologico_completo(
-                    cultivo, fase_fenologica, ndvi_val, temp_val,
-                    humedad_val, precip_actual, area_ha
+        with col_b:
+            if st.button("📋 Plan agroecológico completo"):
+                with st.spinner("Generando plan completo…"):
+                    plan = generar_plan_agroecologico_completo(
+                        cultivo, fase_fenologica, ndvi_val, temp_val,
+                        humedad_val, precip_actual, area_ha
+                    )
+                st.markdown("### 📋 Plan Agroecológico Integral")
+                st.markdown(plan)
+                st.download_button(
+                    "⬇️ Descargar plan",
+                    data=plan,
+                    file_name=f"plan_agroecologico_{cultivo}.txt",
                 )
-            st.markdown("### 📋 Plan Agroecológico Integral")
-            st.markdown(plan)
-            st.download_button(
-                "⬇️ Descargar plan",
-                data=plan,
-                file_name=f"plan_agroecologico_{cultivo}.txt",
-            )
 
-    # Indicadores de contexto visible
-    st.markdown("---")
-    st.caption(
-        f"📊 Contexto enviado a la IA — NDVI: {ndvi_val:.3f} · "
-        f"Temp: {temp_val:.1f}°C · Humedad: {humedad_val:.2f} · "
-        f"Precip: {precip_actual:.1f} mm · Fase: {fase_fenologica} · "
-        f"Cultivo: {cultivo}"
-    )
+        # Indicadores de contexto visible
+        st.markdown("---")
+        st.caption(
+            f"📊 Contexto enviado a la IA — NDVI: {ndvi_val:.3f} · "
+            f"Temp: {temp_val:.1f}°C · Humedad: {humedad_val:.2f} · "
+            f"Precip: {precip_actual:.1f} mm · Fase: {fase_fenologica} · "
+            f"Cultivo: {cultivo}"
+        )
+    except Exception as e:
+        st.error(f"⚠️ Error en Agroecología: {e}")
+        st.info("Configure GROQ_API_KEY para recomendaciones de IA.")
 
 # ============================================================
 # CARBONO Y CRÉDITOS
 # ============================================================
 with tab_carbono:
-    st.header("🌍 Carbono y Créditos de Carbono")
-    st.markdown(
-        "Estimación de carbono almacenado (t C/ha) y créditos de carbono "
-        "calculados a partir del NDVI y la precipitación anual de la parcela."
-    )
+    try:
+        st.header("🌍 Carbono y Créditos de Carbono")
+        st.markdown(
+            "Estimación de carbono almacenado (t C/ha) y créditos de carbono "
+            "calculados a partir del NDVI y la precipitación anual de la parcela."
+        )
 
-    calc_c = CalculadorCarbono()
-    precip_anual = estimar_precipitacion_anual(df_precip)
-    res_c = calc_c.calcular_carbono_hectarea(ndvi_val, precip_anual)
+        calc_c = CalculadorCarbono()
+        precip_anual = estimar_precipitacion_anual(df_precip)
+        res_c = calc_c.calcular_carbono_hectarea(ndvi_val, precip_anual)
 
-    co2_total   = round(res_c['co2_equivalente_ton_ha'] * area_ha, 2)
-    creditos    = round(co2_total / 1000, 4)
-    precio_usd  = round(creditos * 15, 2)
+        co2_total   = round(res_c['co2_equivalente_ton_ha'] * area_ha, 2)
+        creditos    = round(co2_total / 1000, 4)
+        precio_usd  = round(creditos * 15, 2)
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("🌿 C total (t C/ha)",  f"{res_c['carbono_total_ton_ha']}")
-    c2.metric("☁️ CO₂e (t/ha)",        f"{res_c['co2_equivalente_ton_ha']}")
-    c3.metric("📐 Área",               f"{area_ha:.2f} ha")
-    c4.metric("🪙 Créditos (kt CO₂e)", f"{creditos:.4f}")
-    c5.metric("💵 Valor estimado USD",  f"${precio_usd:,.2f}")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("🌿 C total (t C/ha)",  f"{res_c['carbono_total_ton_ha']}")
+        c2.metric("☁️ CO₂e (t/ha)",        f"{res_c['co2_equivalente_ton_ha']}")
+        c3.metric("📐 Área",               f"{area_ha:.2f} ha")
+        c4.metric("🪙 Créditos (kt CO₂e)", f"{creditos:.4f}")
+        c5.metric("💵 Valor estimado USD",  f"${precio_usd:,.2f}")
 
-    st.markdown("---")
-    st.subheader("📊 Desglose por pool de carbono")
-    df_pools = pd.DataFrame(
-        list(res_c['desglose'].items()),
-        columns=['Pool de carbono', 't C/ha']
-    )
-    st.dataframe(df_pools, use_container_width=True)
+        st.markdown("---")
+        st.subheader("📊 Desglose por pool de carbono")
+        df_pools = pd.DataFrame(
+            list(res_c['desglose'].items()),
+            columns=['Pool de carbono', 't C/ha']
+        )
+        st.dataframe(df_pools, use_container_width=True)
 
-    # Gráfico de barras
-    fig_c, ax_c = plt.subplots(figsize=(8, 3))
-    bars = ax_c.barh(df_pools['Pool de carbono'], df_pools['t C/ha'],
-                     color=['#2ecc71','#27ae60','#f39c12','#e67e22','#8e44ad'])
-    ax_c.set_xlabel('t C/ha')
-    ax_c.set_title(f'Distribución de carbono — {cultivo} · {area_ha:.2f} ha')
-    for bar, val in zip(bars, df_pools['t C/ha']):
-        ax_c.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height()/2,
-                  f'{val:.3f}', va='center', fontsize=9)
-    plt.tight_layout()
-    st.pyplot(fig_c)
+        # Gráfico de barras
+        fig_c, ax_c = plt.subplots(figsize=(8, 3))
+        bars = ax_c.barh(df_pools['Pool de carbono'], df_pools['t C/ha'],
+                         color=['#2ecc71','#27ae60','#f39c12','#e67e22','#8e44ad'])
+        ax_c.set_xlabel('t C/ha')
+        ax_c.set_title(f'Distribución de carbono — {cultivo} · {area_ha:.2f} ha')
+        for bar, val in zip(bars, df_pools['t C/ha']):
+            ax_c.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height()/2,
+                      f'{val:.3f}', va='center', fontsize=9)
+        plt.tight_layout()
+        st.pyplot(fig_c)
 
-    st.markdown("---")
-    st.info(
-        f"💡 Precipitación anual estimada: **{precip_anual:.0f} mm/año** · "
-        f"Precio de referencia: **15 USD/t CO₂e** (mercado voluntario)."
-    )
-    st.download_button(
-        "⬇️ Exportar reporte de carbono CSV",
-        data=pd.DataFrame([{
-            'cultivo': cultivo, 'area_ha': area_ha,
-            'ndvi': ndvi_val, 'precip_anual_mm': precip_anual,
-            **res_c['desglose'],
-            'carbono_total_ton_ha': res_c['carbono_total_ton_ha'],
-            'co2e_ton_ha': res_c['co2_equivalente_ton_ha'],
-            'co2e_total_parcela': co2_total,
-            'creditos_kton': creditos,
-            'valor_usd': precio_usd,
-        }]).to_csv(index=False),
-        file_name=f"carbono_{cultivo}_{area_ha:.1f}ha.csv",
-        mime="text/csv",
-    )
-
+        st.markdown("---")
+        st.info(
+            f"💡 Precipitación anual estimada: **{precip_anual:.0f} mm/año** · "
+            f"Precio de referencia: **15 USD/t CO₂e** (mercado voluntario)."
+        )
+        st.download_button(
+            "⬇️ Exportar reporte de carbono CSV",
+            data=pd.DataFrame([{
+                'cultivo': cultivo, 'area_ha': area_ha,
+                'ndvi': ndvi_val, 'precip_anual_mm': precip_anual,
+                **res_c['desglose'],
+                'carbono_total_ton_ha': res_c['carbono_total_ton_ha'],
+                'co2e_ton_ha': res_c['co2_equivalente_ton_ha'],
+                'co2e_total_parcela': co2_total,
+                'creditos_kton': creditos,
+                'valor_usd': precio_usd,
+            }]).to_csv(index=False),
+            file_name=f"carbono_{cultivo}_{area_ha:.1f}ha.csv",
+            mime="text/csv",
+        )
+    except Exception as e:
+        st.error(f"⚠️ Error en Carbono: {e}")
+        st.metric("🌿 C total (t C/ha)", "5.2")
+        st.metric("☁️ CO₂e (t/ha)", "19.1")
+        st.caption("Valores por defecto - configure GEE para datos reales")
