@@ -2313,7 +2313,14 @@ with tab_chat:
     if not GROQ_AVAILABLE or not GROQ_API_KEY:
         st.warning("Configura GROQ_API_KEY en .streamlit/secrets.toml para usar el asistente.")
     else:
-        _ctx_elev2  = str(round(elevation_est)) + " m" if elevation_est else "desconocida"
+        # Fix: usar DEM si está cargado, sino heurística (con etiqueta clara)
+        _dem_ss = st.session_state.get("dem_data")
+        if _dem_ss is not None:
+            _ctx_elev2 = str(round(float(np.nanmean(_dem_ss.values)))) + " m (DEM)"
+        elif elevation_est:
+            _ctx_elev2 = str(round(elevation_est)) + " m (estimado)"
+        else:
+            _ctx_elev2 = "desconocida"
         _ctx_ndre2  = str(round(ndre_val, 3)) if ndre_val is not None else "no disponible"
         _ctx_vuln2  = vuln_score
 
@@ -2346,9 +2353,11 @@ with tab_chat:
                     _fmt = "Responde en maximo 120 palabras, sin listas ni subtitulos."
                 else:
                     _fmt = ("Responde en 3 parrafos sin listas numeradas: "
-                            "1) Diagnostico con valores exactos y brechas. "
-                            "2) Recomendacion concreta. "
-                            "3) Los 3 indicadores clave a monitorear. Maximo 300 palabras.")
+                            "1) Diagnostico: cita los valores actuales y su brecha respecto al umbral. "
+                            "2) Recomendacion concreta con condicion o fecha especifica. "
+                            "3) Indicadores a monitorear: para cada uno indica valor actual "
+                            "y el valor objetivo o delta esperado si el manejo es exitoso. "
+                            "Maximo 300 palabras.")
 
                 sistema_lines = [
                     "Sos un ingeniero agronomo experto en " + cultivo + " (Peru andino).",
