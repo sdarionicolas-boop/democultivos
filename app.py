@@ -2336,12 +2336,23 @@ DATOS ACTUALES DE LA PARCELA:
 - Estado ENFEN: {_ctx_enfen}
 - Score vulnerabilidad FEN: {_ctx_vuln}/10"""
 
-        pregunta = st.text_area(
-            "¿Qué querés saber?",
-            placeholder="Ej: ¿Está en buen estado el cultivo? ¿Cuándo conviene fertilizar? ¿Hay riesgo de helada?",
-            height=80,
-            key="chat_pregunta"
-        )
+        col_preg, col_modo = st.columns([3, 1])
+        with col_preg:
+            pregunta = st.text_area(
+                "¿Qué querés saber?",
+                placeholder="Ej: ¿Está en buen estado el cultivo? ¿Cuándo conviene fertilizar? ¿Hay riesgo de helada?",
+                height=80,
+                key="chat_pregunta"
+            )
+        with col_modo:
+            modo = st.radio(
+                "Respuesta",
+                ["Corta", "Detallada"],
+                index=0,
+                key="chat_modo",
+                help="Corta: hasta 200 palabras. Detallada: análisis completo."
+            )
+            _max_tok = 350 if modo == "Corta" else 900
 
         if st.button("Consultar", type="primary", key="chat_enviar"):
             if not pregunta.strip():
@@ -2350,7 +2361,7 @@ DATOS ACTUALES DE LA PARCELA:
                 with st.spinner("Consultando..."):
                     respuesta = consultar_groq(
                         pregunta.strip(),
-                        max_tokens=400,
+                        max_tokens=_max_tok,
                         model="llama-3.3-70b-versatile"
                     )
                 if respuesta:
