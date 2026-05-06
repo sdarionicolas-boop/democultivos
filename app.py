@@ -1193,6 +1193,36 @@ def estimar_precipitacion_anual(df_precip: pd.DataFrame) -> float:
     media_diaria = df_precip['precip'].mean()
     return round(media_diaria * 365, 0)
 
+class CalculadorHuella:
+    """Calcula emisiones de GEI para actividades agricolas (kg CO2e y t CO2e)."""
+    FACTORES = {
+        'fertilizante_n': 4.5,    # kg CO2e / kg N  (produccion + N2O aplicacion)
+        'diesel':         2.68,   # kg CO2e / litro
+        'electricidad':   0.40,   # kg CO2e / kWh
+        'labranza':       50.0,   # kg CO2e / ha    (combustible por pasada)
+        'riego':          150.0,  # kg CO2e / ha    (bombeo electrico/diesel)
+        'semillas':       0.50,   # kg CO2e / kg semilla
+        'plaguicidas':    6.30,   # kg CO2e / kg producto (IPCC/literatura)
+    }
+
+    def calcular_emisiones(self, datos: dict) -> dict:
+        f = self.FACTORES
+        detalle = {
+            'Fertilizante N':  round(datos.get('fertilizante_n_kg', 0) * f['fertilizante_n'], 2),
+            'Diesel':          round(datos.get('diesel_l',           0) * f['diesel'],         2),
+            'Electricidad':    round(datos.get('electricidad_kwh',   0) * f['electricidad'],   2),
+            'Labranza':        round(datos.get('labranza_ha',        0) * f['labranza'],       2),
+            'Riego':           round(datos.get('riego_ha',           0) * f['riego'],          2),
+            'Semillas':        round(datos.get('semillas_kg',        0) * f['semillas'],       2),
+            'Plaguicidas':     round(datos.get('plaguicidas_kg',     0) * f['plaguicidas'],    2),
+        }
+        total_kg = round(sum(detalle.values()), 2)
+        return {
+            'total_kg_co2e':  total_kg,
+            'total_ton_co2e': round(total_kg / 1000, 4),
+            'detalle':        detalle,
+        }
+
 # ============================================================
 # INTERFAZ PRINCIPAL
 # ============================================================
@@ -2233,40 +2263,73 @@ with tab_agro:
 with tab_carbono:
     try:
         st.header("🌍 Carbono y Créditos de Carbono")
-        st.markdown(
-            "Estimación de carbono almacenado (t C/ha) y créditos de carbono "
-            "calculados a partir del NDVI y la precipitación anual de la parcela."
-        )
+        st.markdown("Estimacion de carbono almacenado y calculo de huella de carbono.")
 
         calc_c = CalculadorCarbono()
         precip_anual = estimar_precipitacion_anual(df_precip)
         res_c = calc_c.calcular_carbono_hectarea(ndvi_val, precip_anual)
 
-        co2_total   = round(res_c['co2_equivalente_ton_ha'] * area_ha, 2)
-        creditos    = round(co2_total / 1000, 4)
-        precio_usd  = round(creditos * 15, 2)
+        co2_total  = round(res_c['co2_equivalente_ton_ha'] * area_ha, 2)
+        creditos   = round(co2_total / 1000, 4)
+        precio_usd = round(creditos * 15, 2)
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("🌿 C total (t C/ha)",  f"{res_c['carbono_total_ton_ha']}")
-        c2.metric("☁️ CO₂e (t/ha)",        f"{res_c['co2_equivalente_ton_ha']}")
-        c3.metric("📐 Área",               f"{area_ha:.2f} ha")
-        c4.metric("🪙 Créditos (kt CO₂e)", f"{creditos:.4f}")
-        c5.metric("💵 Valor estimado USD",  f"${precio_usd:,.2f}")
+        # ── Huella de carbono (emisiones) ─────────────────────────
+        st.subheader("📋 Datos de actividades (huella)")
+        with st.expander("Ingresar consumos y practicas agricolas"):
+            col1, col2 = st.columns(2)
+            with col1:
+                fert_n       = st.number_input("Fertilizante nitrogenado (kg N)", min_value=0.0, step=10.0,  key="fert_n")
+                diesel_l     = st.number_input("Diesel consumido (litros)",        min_value=0.0, step=10.0,  key="diesel")
+                electricidad = st.number_input("Electricidad (kWh)",               min_value=0.0, step=50.0,  key="elec")
+                labranza     = st.number_input("Hectareas con labranza",           min_value=0.0, step=0.1,   key="lab")
+            with col2:
+                riego        = st.number_input("Hectareas regadas",                min_value=0.0, step=0.1,   key="riego")
+                semillas     = st.number_input("Semillas (kg)",                    min_value=0.0, step=5.0,   key="sem")
+                plaguicidas  = st.number_input("Plaguicidas (kg)",                 min_value=0.0, step=1.0,   key="plag")
 
+        datos_actividad = {
+            'fertilizante_n_kg':  fert_n,
+            'diesel_l':           diesel_l,
+            'electricidad_kwh':   electricidad,
+            'labranza_ha':        labranza,
+            'riego_ha':           riego,
+            'semillas_kg':        semillas,
+            'plaguicidas_kg':     plaguicidas,
+        }
+
+        calc_h             = CalculadorHuella()
+        huella             = calc_h.calcular_emisiones(datos_actividad)
+        emisiones_totales  = huella['total_ton_co2e']
+        captura_total      = co2_total
+        delta_ton          = round(captura_total - emisiones_totales, 4)
+        neto_creditos      = round(delta_ton / 1000, 6)
+
+        # ── Balance neto ──────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("📊 Balance neto de GEI")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("🌿 Captura potencial",  f"{captura_total:.2f} t CO2e")
+        m2.metric("🏭 Emisiones totales",  f"{emisiones_totales:.4f} t CO2e")
+        m3.metric("⚖️ Delta neto",         f"{delta_ton:+.4f} t CO2e",
+                  delta="Sumidero" if delta_ton > 0 else "Fuente neta")
+        m4.metric("🪙 Creditos netos",     f"{neto_creditos:.6f} kt CO2e")
+
+        with st.expander("🔍 Ver detalle de emisiones por actividad"):
+            df_huella = pd.DataFrame(list(huella['detalle'].items()), columns=['Actividad', 'kg CO2e'])
+            st.dataframe(df_huella, use_container_width=True)
+            st.caption(f"Total emisiones: {huella['total_kg_co2e']:.1f} kg CO2e")
+
+        # ── Pools de captura ──────────────────────────────────────
         st.markdown("---")
         st.subheader("📊 Desglose por pool de carbono")
-        df_pools = pd.DataFrame(
-            list(res_c['desglose'].items()),
-            columns=['Pool de carbono', 't C/ha']
-        )
+        df_pools = pd.DataFrame(list(res_c['desglose'].items()), columns=['Pool de carbono', 't C/ha'])
         st.dataframe(df_pools, use_container_width=True)
 
-        # Gráfico de barras
         fig_c, ax_c = plt.subplots(figsize=(8, 3))
         bars = ax_c.barh(df_pools['Pool de carbono'], df_pools['t C/ha'],
                          color=['#2ecc71','#27ae60','#f39c12','#e67e22','#8e44ad'])
         ax_c.set_xlabel('t C/ha')
-        ax_c.set_title(f'Distribución de carbono — {cultivo} · {area_ha:.2f} ha')
+        ax_c.set_title(f'Distribucion de carbono — {cultivo} · {area_ha:.2f} ha')
         for bar, val in zip(bars, df_pools['t C/ha']):
             ax_c.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height()/2,
                       f'{val:.3f}', va='center', fontsize=9)
@@ -2275,30 +2338,32 @@ with tab_carbono:
 
         st.markdown("---")
         st.info(
-            f"💡 Precipitación anual estimada: **{precip_anual:.0f} mm/año** · "
-            f"Precio de referencia: **15 USD/t CO₂e** (mercado voluntario)."
+            f"Precipitacion anual estimada: {precip_anual:.0f} mm/anio · "
+            f"Precio referencia: 15 USD/t CO2e · "
+            f"Delta positivo = sumidero neto."
         )
         st.download_button(
-            "⬇️ Exportar reporte de carbono CSV",
+            "⬇️ Exportar reporte completo CSV",
             data=pd.DataFrame([{
                 'cultivo': cultivo, 'area_ha': area_ha,
                 'ndvi': ndvi_val, 'precip_anual_mm': precip_anual,
                 **res_c['desglose'],
-                'carbono_total_ton_ha': res_c['carbono_total_ton_ha'],
-                'co2e_ton_ha': res_c['co2_equivalente_ton_ha'],
-                'co2e_total_parcela': co2_total,
-                'creditos_kton': creditos,
-                'valor_usd': precio_usd,
+                'carbono_total_ton_ha':    res_c['carbono_total_ton_ha'],
+                'co2e_ton_ha':             res_c['co2_equivalente_ton_ha'],
+                'co2e_captura_parcela':    captura_total,
+                'emisiones_totales_ton':   emisiones_totales,
+                'delta_neto_ton':          delta_ton,
+                'creditos_netos_kton':     neto_creditos,
+                'precio_usd_estimado':     precio_usd,
             }]).to_csv(index=False),
-            file_name=f"carbono_{cultivo}_{area_ha:.1f}ha.csv",
+            file_name=f"balance_{cultivo}_{area_ha:.1f}ha.csv",
             mime="text/csv",
         )
+
     except Exception as e:
         st.error(f"⚠️ Error en Carbono: {e}")
-        st.metric("🌿 C total (t C/ha)", "5.2")
-        st.metric("☁️ CO₂e (t/ha)", "19.1")
-        st.caption("Valores por defecto - configure GEE para datos reales")
-
+        st.metric("🌿 Captura", "N/D")
+        st.metric("🏭 Emisiones", "N/D")
 
 # ============================================================
 # ASISTENTE IA — CHAT LIBRE CON CONTEXTO DE PARCELA
