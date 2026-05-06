@@ -1308,7 +1308,7 @@ codigo_enfen = (2 if "alerta" in contexto_fen["estado"].lower()
 # ============================================================
 (tab_dashboard, tab_mapas, tab_monitoreo,
  tab_alerta, tab_gobernanza, tab_export, tab_fen, tab_dem,
- tab_npk, tab_agro, tab_carbono) = st.tabs([
+ tab_npk, tab_agro, tab_carbono, tab_chat) = st.tabs([
     "📊 Dashboard General",
     "🗺️ Mapa de Riesgo",
     "📈 Monitoreo Fenológico",
@@ -1320,6 +1320,7 @@ codigo_enfen = (2 if "alerta" in contexto_fen["estado"].lower()
     "🌾 Fertilidad NPK",
     "🌱 Agroecología",
     "🌍 Carbono",
+    "💬 Asistente",
 ])
 
 # ============================================================
@@ -2297,3 +2298,70 @@ with tab_carbono:
         st.metric("🌿 C total (t C/ha)", "5.2")
         st.metric("☁️ CO₂e (t/ha)", "19.1")
         st.caption("Valores por defecto - configure GEE para datos reales")
+
+# ============================================================
+# ASISTENTE IA — CHAT LIBRE CON CONTEXTO DE PARCELA
+# ============================================================
+with tab_chat:
+    st.header("💬 Asistente de parcela")
+    st.markdown(
+        "Hacé cualquier pregunta sobre tu parcela. "
+        "El asistente conoce el estado actual del cultivo y responde en base a esos datos."
+    )
+
+    if not GROQ_AVAILABLE or not GROQ_API_KEY:
+        st.warning("⚠️ Configurá GROQ_API_KEY en `.streamlit/secrets.toml` para usar el asistente.")
+    else:
+        # Contexto de parcela construido con los datos reales disponibles
+        _ctx_elev  = f"{elevation_est:.0f} m" if elevation_est else "desconocida"
+        _ctx_ndre  = f"{ndre_val:.3f}" if ndre_val is not None else "no disponible"
+        _ctx_enfen = contexto_fen.get("estado", "sin datos")
+        _ctx_vuln  = vuln_score
+
+        _sistema = f"""Sos un ingeniero agrónomo especializado en cultivos andinos peruanos (ají amarillo, rocoto, papa andina).
+Respondés preguntas concretas sobre el estado de una parcela usando los datos reales proporcionados.
+Tus respuestas son directas, técnicas y orientadas a la acción. Máximo 250 palabras.
+No repetís los datos del contexto textualmente — solo los usás para fundamentar tu respuesta.
+
+DATOS ACTUALES DE LA PARCELA:
+- Cultivo: {cultivo}
+- Fase fenológica: {fase_fenologica}
+- Área: {area_ha:.2f} ha
+- NDVI: {ndvi_val:.3f}
+- NDRE: {_ctx_ndre}
+- Temperatura: {temp_val:.1f} °C
+- Humedad suelo: {humedad_val:.2f}
+- Precipitación reciente: {precip_actual:.1f} mm
+- Elevación: {_ctx_elev}
+- Estado ENFEN: {_ctx_enfen}
+- Score vulnerabilidad FEN: {_ctx_vuln}/10"""
+
+        pregunta = st.text_area(
+            "¿Qué querés saber?",
+            placeholder="Ej: ¿Está en buen estado el cultivo? ¿Cuándo conviene fertilizar? ¿Hay riesgo de helada?",
+            height=80,
+            key="chat_pregunta"
+        )
+
+        if st.button("Consultar", type="primary", key="chat_enviar"):
+            if not pregunta.strip():
+                st.warning("Escribí una pregunta primero.")
+            else:
+                with st.spinner("Consultando..."):
+                    respuesta = consultar_groq(
+                        pregunta.strip(),
+                        max_tokens=400,
+                        model="llama-3.3-70b-versatile"
+                    )
+                if respuesta:
+                    st.markdown("---")
+                    st.markdown(respuesta)
+                else:
+                    st.error("No se obtuvo respuesta. Verificá la GROQ_API_KEY.")
+
+        st.markdown("---")
+        st.caption(
+            f"Contexto activo — {cultivo} · {fase_fenologica} · "
+            f"NDVI {ndvi_val:.3f} · {temp_val:.1f}°C · "
+            f"Elevación {_ctx_elev} · FEN {_ctx_vuln}/10"
+        )
