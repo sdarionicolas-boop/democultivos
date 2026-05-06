@@ -2299,59 +2299,31 @@ with tab_carbono:
         st.metric("☁️ CO₂e (t/ha)", "19.1")
         st.caption("Valores por defecto - configure GEE para datos reales")
 
+
 # ============================================================
 # ASISTENTE IA — CHAT LIBRE CON CONTEXTO DE PARCELA
 # ============================================================
 with tab_chat:
-    st.header("💬 Asistente de parcela")
+    st.header("Asistente de parcela")
     st.markdown(
-        "Hacé cualquier pregunta sobre tu parcela. "
+        "Hace cualquier pregunta sobre tu parcela. "
         "El asistente conoce el estado actual del cultivo y responde en base a esos datos."
     )
 
     if not GROQ_AVAILABLE or not GROQ_API_KEY:
-        st.warning("⚠️ Configurá GROQ_API_KEY en `.streamlit/secrets.toml` para usar el asistente.")
+        st.warning("Configura GROQ_API_KEY en .streamlit/secrets.toml para usar el asistente.")
     else:
-        # Contexto de parcela construido con los datos reales disponibles
-        _ctx_elev  = f"{elevation_est:.0f} m" if elevation_est else "desconocida"
-        _ctx_ndre  = f"{ndre_val:.3f}" if ndre_val is not None else "no disponible"
-        _ctx_enfen = contexto_fen.get("estado", "sin datos")
-        _ctx_vuln  = vuln_score
-
-        # Umbrales específicos del cultivo para el prompt
-        _u = UMBRALES[cultivo]
-        _enfen_detalle = contexto_fen  # dict completo
-        _modo_inst = (
-            "Respondé en máximo 120 palabras. Una sola sección, sin subtítulos, sin listas."
-            if modo == "Corta" else
-            "Respondé en exactamente 3 párrafos cortos sin listas numeradas: "
-            "1) Diagnóstico con los valores exactos y sus brechas. "
-            "2) Recomendación concreta con fechas o condiciones específicas. "
-            "3) Los 3 indicadores clave a monitorear y por qué. Máximo 300 palabras total."
-        )
-        _sistema = f"""Sos un ingeniero agrónomo experto en {cultivo} (Perú andino).
-REGLAS ESTRICTAS:
-- PROHIBIDO usar rangos genéricos (no escribas "15–25°C" ni "0.4–0.6"). Usá SOLO los valores del contexto.
-- OBLIGATORIO mencionar {cultivo} por nombre en la respuesta.
-- OBLIGATORIO citar al menos 3 valores numéricos del contexto con su interpretación.
-- Si algo está fuera de umbral, indicá la brecha exacta (ej: "humedad 0.25, necesita subir 0.05 para llegar al mínimo de {_u["humedad_min"]}").
-- {_modo_inst}
-
-CONTEXTO DE LA PARCELA (usá estos datos, no inventes):
-Cultivo: {cultivo} | Fase: {fase_fenologica} | Área: {area_ha:.2f} ha | Elevación: {_ctx_elev}
-NDVI: {ndvi_val:.3f} (mínimo {cultivo}: {_u["NDVI_min"]}) | NDRE: {_ctx_ndre} (mínimo: {_u["NDRE_min"]})
-Temp: {temp_val:.1f}°C (óptimo {cultivo}: {_u["temp_min"]}–{_u["temp_max"]}°C)
-Humedad suelo: {humedad_val:.2f} (óptimo: {_u["humedad_min"]}–{_u["humedad_max"]})
-Precip reciente: {precip_actual:.1f} mm | FEN score: {_ctx_vuln}/10
-ENFEN: {_enfen_detalle.get("estado_alerta", _ctx_enfen)} — {_enfen_detalle.get("magnitud", "")} — riesgo agrícola: {_enfen_detalle.get("nivel_riesgo_agricola", "")} — lluvias: {_enfen_detalle.get("probabilidad_lluvias", "")}"""
+        _ctx_elev2  = str(round(elevation_est)) + " m" if elevation_est else "desconocida"
+        _ctx_ndre2  = str(round(ndre_val, 3)) if ndre_val is not None else "no disponible"
+        _ctx_vuln2  = vuln_score
 
         col_preg, col_modo = st.columns([3, 1])
         with col_preg:
             pregunta = st.text_area(
-                "¿Qué querés saber?",
-                placeholder="Ej: ¿Está en buen estado el cultivo? ¿Cuándo conviene fertilizar? ¿Hay riesgo de helada?",
+                "Que queres saber?",
+                placeholder="Ej: Esta en buen estado el cultivo? Cuando conviene fertilizar?",
                 height=80,
-                key="chat_pregunta"
+                key="chat_pregunta",
             )
         with col_modo:
             modo = st.radio(
@@ -2359,29 +2331,61 @@ ENFEN: {_enfen_detalle.get("estado_alerta", _ctx_enfen)} — {_enfen_detalle.get
                 ["Corta", "Detallada"],
                 index=0,
                 key="chat_modo",
-                help="Corta: hasta 200 palabras. Detallada: análisis completo."
+                help="Corta: ~120 palabras. Detallada: 3 parrafos tecnicos.",
             )
             _max_tok = 350 if modo == "Corta" else 900
 
         if st.button("Consultar", type="primary", key="chat_enviar"):
             if not pregunta.strip():
-                st.warning("Escribí una pregunta primero.")
+                st.warning("Escribi una pregunta primero.")
             else:
+                # Construir system prompt AQUI — modo ya esta definido
+                _u2 = UMBRALES[cultivo]
+                _en = contexto_fen
+                if modo == "Corta":
+                    _fmt = "Responde en maximo 120 palabras, sin listas ni subtitulos."
+                else:
+                    _fmt = ("Responde en 3 parrafos sin listas numeradas: "
+                            "1) Diagnostico con valores exactos y brechas. "
+                            "2) Recomendacion concreta. "
+                            "3) Los 3 indicadores clave a monitorear. Maximo 300 palabras.")
+
+                sistema_lines = [
+                    "Sos un ingeniero agronomo experto en " + cultivo + " (Peru andino).",
+                    "REGLAS: Prohibido usar rangos genericos. Usa SOLO los valores del contexto.",
+                    "OBLIGATORIO mencionar " + cultivo + " por nombre y citar 3 numeros exactos del contexto.",
+                    _fmt,
+                    "",
+                    "CONTEXTO DE LA PARCELA:",
+                    "Cultivo: " + cultivo + " | Fase: " + fase_fenologica + " | Area: " + str(round(area_ha, 2)) + " ha | Elevacion: " + _ctx_elev2,
+                    "NDVI: " + str(round(ndvi_val, 3)) + " (minimo para " + cultivo + ": " + str(_u2["NDVI_min"]) + ")",
+                    "NDRE: " + _ctx_ndre2 + " (minimo: " + str(_u2["NDRE_min"]) + ")",
+                    "Temp: " + str(round(temp_val, 1)) + "C (optimo " + cultivo + ": " + str(_u2["temp_min"]) + "-" + str(_u2["temp_max"]) + "C)",
+                    "Humedad suelo: " + str(round(humedad_val, 2)) + " (optimo: " + str(_u2["humedad_min"]) + "-" + str(_u2["humedad_max"]) + ")",
+                    "Precip reciente: " + str(round(precip_actual, 1)) + " mm | FEN score: " + str(_ctx_vuln2) + "/10",
+                    "ENFEN estado: " + str(_en.get("estado_alerta", "")) + " | Magnitud: " + str(_en.get("magnitud", "")) + " | Riesgo agric: " + str(_en.get("nivel_riesgo_agricola", "")) + " | Lluvias: " + str(_en.get("probabilidad_lluvias", "")),
+                    "",
+                    "PREGUNTA DEL USUARIO:",
+                ]
+                prompt_completo = "\n".join(sistema_lines) + "\n" + pregunta.strip()
+
                 with st.spinner("Consultando..."):
                     respuesta = consultar_groq(
-                        pregunta.strip(),
+                        prompt_completo,
                         max_tokens=_max_tok,
-                        model="llama-3.3-70b-versatile"
+                        model="llama-3.3-70b-versatile",
                     )
                 if respuesta:
                     st.markdown("---")
                     st.markdown(respuesta)
                 else:
-                    st.error("No se obtuvo respuesta. Verificá la GROQ_API_KEY.")
+                    st.error("No se obtuvo respuesta. Verifica la GROQ_API_KEY.")
 
         st.markdown("---")
         st.caption(
-            f"Contexto activo — {cultivo} · {fase_fenologica} · "
-            f"NDVI {ndvi_val:.3f} · {temp_val:.1f}°C · "
-            f"Elevación {_ctx_elev} · FEN {_ctx_vuln}/10"
+            "Contexto activo — " + cultivo + " | " + fase_fenologica +
+            " | NDVI " + str(round(ndvi_val, 3)) +
+            " | " + str(round(temp_val, 1)) + "C" +
+            " | Elevacion " + _ctx_elev2 +
+            " | FEN " + str(_ctx_vuln2) + "/10"
         )
