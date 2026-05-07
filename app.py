@@ -729,14 +729,18 @@ def calcular_vulnerabilidad_fen(gdf, cultivo, ndvi_actual, temp_actual, precip_a
 # ============================================================
 # FUNCIONES IA (GROQ)
 # ============================================================
-def consultar_groq(prompt, max_tokens=700, model="llama-3.3-70b-versatile"):
+def consultar_groq(prompt, max_tokens=700, model="llama-3.3-70b-versatile", system_prompt=None):
     if not GROQ_API_KEY or not GROQ_AVAILABLE:
         return "⚠️ IA no disponible. Configura GROQ_API_KEY."
     try:
         client = Groq(api_key=GROQ_API_KEY)
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
         response = client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             max_tokens=max_tokens,
             temperature=0.5,
         )
@@ -2424,9 +2428,13 @@ with tab_chat:
                             "y el valor objetivo o delta esperado si el manejo es exitoso. "
                             "Maximo 300 palabras.")
 
+                from datetime import datetime as _dt
+                _fecha_hoy = _dt.now().strftime("%d/%m/%Y")
                 sistema_lines = [
                     "Sos un ingeniero agronomo experto en " + cultivo + " (Peru andino).",
+                    "Fecha actual: " + _fecha_hoy + ".",
                     "REGLAS: Prohibido usar rangos genericos. Usa SOLO los valores del contexto.",
+                    "Si te preguntan la fecha o el dia, responde SOLO con la fecha actual indicada arriba.",
                     "OBLIGATORIO mencionar " + cultivo + " por nombre y citar 3 numeros exactos del contexto.",
                     _fmt,
                     "",
@@ -2438,16 +2446,15 @@ with tab_chat:
                     "Humedad suelo: " + str(round(humedad_val, 2)) + " (optimo: " + str(_u2["humedad_min"]) + "-" + str(_u2["humedad_max"]) + ")",
                     "Precip reciente: " + str(round(precip_actual, 1)) + " mm | FEN score: " + str(_ctx_vuln2) + "/10",
                     "ENFEN estado: " + str(_en.get("estado_alerta", "")) + " | Magnitud: " + str(_en.get("magnitud", "")) + " | Riesgo agric: " + str(_en.get("nivel_riesgo_agricola", "")) + " | Lluvias: " + str(_en.get("probabilidad_lluvias", "")),
-                    "",
-                    "PREGUNTA DEL USUARIO:",
                 ]
-                prompt_completo = "\n".join(sistema_lines) + "\n" + pregunta.strip()
+                _system_prompt = "\n".join(sistema_lines)
 
                 with st.spinner("Consultando..."):
                     respuesta = consultar_groq(
-                        prompt_completo,
+                        pregunta.strip(),
                         max_tokens=_max_tok,
                         model="llama-3.3-70b-versatile",
+                        system_prompt=_system_prompt,
                     )
                 if respuesta:
                     st.markdown("---")
